@@ -361,6 +361,18 @@ class EBFTPolicyModelActor(BaseModelActor):
 
         self._setup_distributed(strategy)
 
+        def _sync_stage(stage_name: str):
+            try:
+                torch.cuda.synchronize()
+                logger.warning("EBFTPolicyModelActor init stage passed CUDA sync: %s", stage_name)
+            except RuntimeError:
+                logger.error(
+                    "EBFTPolicyModelActor init stage failed CUDA sync: %s",
+                    stage_name,
+                    exc_info=True,
+                )
+                raise
+
         actor = Actor(
             pretrain,
             use_flash_attention_2=strategy.args.flash_attn,
@@ -375,12 +387,15 @@ class EBFTPolicyModelActor(BaseModelActor):
             temperature=strategy.args.temperature,  
             use_liger_kernel=strategy.args.use_liger_kernel,
         )
+        _sync_stage("after Actor(...) construction")
         strategy.print(actor)
+        _sync_stage("after strategy.print(actor)")
 
         # configure tokenizer
         self.tokenizer = get_tokenizer(
             pretrain, actor.model, "left", strategy, use_fast=not strategy.args.disable_fast_tokenizer
         )
+        _sync_stage("after tokenizer construction")
 
         # configure optimizer
         if args.actor_learning_rate == 0:
@@ -425,17 +440,20 @@ class EBFTPolicyModelActor(BaseModelActor):
                 num_training_steps=max_steps,
                 scheduler_specific_kwargs={"min_lr": args.actor_learning_rate * 0.1},
             )
+        _sync_stage("after optimizer/scheduler construction")
 
         if args.gradient_checkpointing:
             actor.gradient_checkpointing_enable(
                 gradient_checkpointing_kwargs={"use_reentrant": args.gradient_checkpointing_use_reentrant}
             )
+            _sync_stage("after gradient checkpointing enable")
 
         # prepare models/optimizers...
         self.actor, self.actor_optim, self.actor_scheduler = strategy.prepare(
             (actor, actor_optim, actor_scheduler),
             is_rlhf=True,
         )
+        _sync_stage("after strategy.prepare")
 
         # load checkpoint
         self.checkpoint_states = {}
@@ -460,6 +478,7 @@ class EBFTPolicyModelActor(BaseModelActor):
             micro_train_batch_size=args.micro_train_batch_size,
             tokenizer=self.tokenizer,
         )
+        _sync_stage("after ActorEBFTTrainer construction")
 
        
     def fit(self, rl_ctl: float = 0, ce_ctl: float = 0, kl_ctl: float = 0):
