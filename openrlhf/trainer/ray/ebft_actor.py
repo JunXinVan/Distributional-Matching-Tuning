@@ -678,6 +678,81 @@ class EBFTPolicyModelActor(BaseModelActor):
         device = torch.cuda.current_device()
         self.actor.eval()
 
+        vocab_size = None
+        try:
+            vocab_size = int(self.actor.model.config.vocab_size)
+        except Exception:
+            pass
+
+        def _tensor_stats(name: str, value):
+            if isinstance(value, torch.Tensor):
+                shape = tuple(value.shape)
+                dtype = str(value.dtype)
+                device_name = str(value.device)
+                if value.numel() == 0:
+                    return f"{name}: shape={shape}, dtype={dtype}, device={device_name}, empty"
+                value_cpu = value.detach().cpu()
+                min_val = value_cpu.min().item()
+                max_val = value_cpu.max().item()
+                return (
+                    f"{name}: shape={shape}, dtype={dtype}, device={device_name}, "
+                    f"min={min_val}, max={max_val}"
+                )
+            if isinstance(value, list):
+                if not value:
+                    return f"{name}: empty list"
+                if isinstance(value[0], (list, tuple)):
+                    rows = len(value)
+                    cols = len(value[0]) if value[0] else 0
+                    flat_min = min(min(row) for row in value if row)
+                    flat_max = max(max(row) for row in value if row)
+                    return f"{name}: list2d shape=({rows}, {cols}), min={flat_min}, max={flat_max}"
+                return f"{name}: list1d len={len(value)}, min={min(value)}, max={max(value)}"
+            return f"{name}: type={type(value).__name__}"
+
+        def _raise_if_invalid_token_range(name: str, value):
+            if vocab_size is None:
+                return
+            if isinstance(value, torch.Tensor):
+                value_cpu = value.detach().cpu()
+            else:
+                value_cpu = torch.as_tensor(value, dtype=torch.long)
+            if value_cpu.numel() == 0:
+                raise ValueError(f"{name} is empty.")
+            invalid_mask = (value_cpu < 0) | (value_cpu >= vocab_size)
+            if invalid_mask.any():
+                invalid_positions = invalid_mask.nonzero(as_tuple=False)[:8].tolist()
+                invalid_values = value_cpu[invalid_mask][:8].tolist()
+                raise ValueError(
+                    f"{name} contains out-of-range token ids for vocab_size={vocab_size}. "
+                    f"sample_positions={invalid_positions}, sample_values={invalid_values}"
+                )
+
+        if not getattr(self, "_logged_strided_input_debug", False):
+            logger.warning(
+                "generate_strided_blocks input summary | vocab_size=%s | stride=%s | context_length=%s | "
+                "generate_length=%s | %s | %s",
+                vocab_size,
+                stride,
+                context_length,
+                generate_length,
+                _tensor_stats("prompt_token_ids", prompt_token_ids),
+                _tensor_stats("doc_ids", doc_ids),
+            )
+            self._logged_strided_input_debug = True
+
+        _raise_if_invalid_token_range("prompt_token_ids", prompt_token_ids)
+
+        try:
+            torch.cuda.synchronize(device)
+        except RuntimeError:
+            logger.error(
+                "CUDA failure surfaced before prompt/doc transfer in generate_strided_blocks. "
+                "This suggests an earlier kernel already poisoned the CUDA stream.",
+                exc_info=True,
+            )
+            raise
+
         # ---- Input normalization & debug ----
         if isinstance(prompt_token_ids, torch.Tensor):
             # allow tensor input, but ensure it's 2D
@@ -691,6 +766,17 @@ class EBFTPolicyModelActor(BaseModelActor):
                 raise ValueError("prompt_token_ids must be List[List[int]] (2-D).")
             original_prompt_tensor = torch.as_tensor(prompt_token_ids, device=device, dtype=torch.long)
             doc_ids = torch.as_tensor(doc_ids, device=device, dtype=torch.long)
+
+        if original_prompt_tensor.dim() != 2:
+            raise ValueError(
+                f"original_prompt_tensor must be 2-D after normalization; got {tuple(original_prompt_tensor.shape)}"
+            )
+        if doc_ids.dim() != 2:
+            raise ValueError(f"doc_ids must be 2-D after normalization; got {tuple(doc_ids.shape)}")
+        if doc_ids.shape[0] != original_prompt_tensor.shape[0]:
+            raise ValueError(
+                f"doc_ids batch size {doc_ids.shape[0]} does not match prompt batch size {original_prompt_tensor.shape[0]}"
+            )
 
         batch_size = original_prompt_tensor.shape[0]
         prompt_length    = original_prompt_tensor.shape[1]
