@@ -219,7 +219,27 @@ class Critic(nn.Module):
     @property
     def config(self):
         """Return the config of the model for compatibility with save_model."""
-        return self.model.config
+        return self._get_attention_control_target().config
+
+    def _get_attention_control_target(self):
+        """Unwrap common wrappers (e.g. DeepSpeed engine) to the underlying HF model."""
+        target = self.model
+        while hasattr(target, "module"):
+            target = target.module
+        return target
+
+    def get_attention_implementation(self):
+        """Return the current HF attention implementation, if exposed by the config."""
+        target = self._get_attention_control_target()
+        return getattr(target.config, "_attn_implementation", None)
+
+    def set_attention_implementation(self, impl: str):
+        """Update the HF attention implementation on the wrapped model config."""
+        target = self._get_attention_control_target()
+        if hasattr(target, "set_attn_implementation"):
+            target.set_attn_implementation(impl)
+        elif hasattr(target, "config"):
+            target.config._attn_implementation = impl
     
     def select_last_answer_token(self, gen_hidden_states, gen_qa_mask, qa_masking=False):
         # gen_hidden_states: (B, NB, G, NF, H)

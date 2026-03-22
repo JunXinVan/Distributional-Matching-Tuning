@@ -172,215 +172,234 @@ class CriticEBFTTrainer(ABC):
             document_masking=self.args.document_masking,
         )
 
+        def _maybe_override_attention_impl(model_wrapper):
+            restore_impl = None
+            if (
+                attention_mask is not None
+                and attention_mask.dim() == 4
+                and getattr(self.args, "gradient_checkpointing", False)
+            ):
+                current_impl = model_wrapper.get_attention_implementation()
+                if current_impl == "flash_attention_2":
+                    restore_impl = current_impl
+                    model_wrapper.set_attention_implementation("eager")
+            return restore_impl
+
         # If we are not training the critic on this step, avoid building an autograd graph.
         # This saves memory/compute when critic LR is 0.
         _forward_ctx = nullcontext() if train_critic else torch.no_grad()
-        with _forward_ctx:
-            gt_hidden_states, gen_hidden_states, gt_classifier_logits, gen_classifier_logits, _ = self.critic(
-                full_sequences.to(device),
-                attention_mask.to(device),
-                pos_ids.to(device),
-                return_classifier_logits=True,
-                context_length=context_length,
-                prompt_length=prompt_length,
-                generate_max_len=generate_max_len,
-                stride=stride,
-                num_blocks=num_blocks,
-                hidden_state_method=self.args.hidden_state_method,
-                qa_masks=qa_masks.to(device),
-                qa_masking=self.args.qa_masking,
+        restore_attention_impl = _maybe_override_attention_impl(self.critic)
+        grad_norm_value: Optional[float] = None
+        try:
+            with _forward_ctx:
+                gt_hidden_states, gen_hidden_states, gt_classifier_logits, gen_classifier_logits, _ = self.critic(
+                    full_sequences.to(device),
+                    attention_mask.to(device),
+                    pos_ids.to(device),
+                    return_classifier_logits=True,
+                    context_length=context_length,
+                    prompt_length=prompt_length,
+                    generate_max_len=generate_max_len,
+                    stride=stride,
+                    num_blocks=num_blocks,
+                    hidden_state_method=self.args.hidden_state_method,
+                    qa_masks=qa_masks.to(device),
+                    qa_masking=self.args.qa_masking,
+                )
+
+            if self.args.critic_sequence_level == "token":
+                gt_classifier_logits = gt_classifier_logits.reshape(batch_size // self.args.n_samples_per_prompt, self.args.n_samples_per_prompt, num_blocks, generate_max_len, gt_classifier_logits.shape[-1])
+                gen_classifier_logits = gen_classifier_logits.reshape(batch_size // self.args.n_samples_per_prompt, self.args.n_samples_per_prompt, num_blocks, generate_max_len, gen_classifier_logits.shape[-1])
+            elif self.args.critic_sequence_level in ["concat", "mean_pooling", "last_token"]:
+                gt_classifier_logits = gt_classifier_logits.reshape(batch_size // self.args.n_samples_per_prompt, self.args.n_samples_per_prompt, num_blocks, gt_classifier_logits.shape[-1])
+                gen_classifier_logits = gen_classifier_logits.reshape(batch_size // self.args.n_samples_per_prompt, self.args.n_samples_per_prompt, num_blocks, gt_classifier_logits.shape[-1])
+
+            # Compute prev metrics in eval mode for deterministic results
+            self.critic.eval()
+            with torch.no_grad():
+                prev_metrics = self.critic_classifier_accuracy_fn(gt_classifier_logits.detach(), gen_classifier_logits.detach())
+                prev_classifier_accuracy = prev_metrics[0]
+                prev_classifier_precision = prev_metrics[1]
+                prev_classifier_recall = prev_metrics[2]
+                prev_classifier_f1_score = prev_metrics[3]
+                prev_classifier_pr_auc = prev_metrics[4]
+                prev_classifier_roc_auc = prev_metrics[5]
+                prev_classifier_mean_prob_gap = prev_metrics[6]
+                prev_classifier_prob_gen = prev_metrics[7]
+                prev_classifier_pred_pos_frac = prev_metrics[8]
+                prev_classifier_acc_thresh0p5 = prev_metrics[9]
+            self.critic.train()
+
+            critic_loss = self.critic_loss_fn(
+                gt_classifier_logits,
+                gen_classifier_logits,
+                sequence_selection=self.args.classifier_sequence_selection,
             )
 
+            critic_classifier_loss = self.args.critic_classifier_loss_coef * critic_loss
+            critic_direct_discrepancy_loss = torch.zeros((), device=device, dtype=critic_classifier_loss.dtype)
 
-        if self.args.critic_sequence_level == "token":
-            gt_classifier_logits = gt_classifier_logits.reshape(batch_size // self.args.n_samples_per_prompt, self.args.n_samples_per_prompt, num_blocks, generate_max_len, gt_classifier_logits.shape[-1])
-            gen_classifier_logits = gen_classifier_logits.reshape(batch_size // self.args.n_samples_per_prompt, self.args.n_samples_per_prompt, num_blocks, generate_max_len, gen_classifier_logits.shape[-1])
-        elif self.args.critic_sequence_level in ["concat", "mean_pooling", "last_token"]:
-            gt_classifier_logits = gt_classifier_logits.reshape(batch_size // self.args.n_samples_per_prompt, self.args.n_samples_per_prompt, num_blocks, gt_classifier_logits.shape[-1])
-            gen_classifier_logits = gen_classifier_logits.reshape(batch_size // self.args.n_samples_per_prompt, self.args.n_samples_per_prompt, num_blocks, gen_classifier_logits.shape[-1])
-
-        # Compute prev metrics in eval mode for deterministic results
-        self.critic.eval()
-        with torch.no_grad():
-            prev_metrics = self.critic_classifier_accuracy_fn(gt_classifier_logits.detach(), gen_classifier_logits.detach())
-            prev_classifier_accuracy = prev_metrics[0]
-            prev_classifier_precision = prev_metrics[1]
-            prev_classifier_recall = prev_metrics[2]
-            prev_classifier_f1_score = prev_metrics[3]
-            prev_classifier_pr_auc = prev_metrics[4]
-            prev_classifier_roc_auc = prev_metrics[5]
-            prev_classifier_mean_prob_gap = prev_metrics[6]
-            prev_classifier_prob_gen = prev_metrics[7]
-            prev_classifier_pred_pos_frac = prev_metrics[8]
-            prev_classifier_acc_thresh0p5 = prev_metrics[9]
-        self.critic.train()
-
-        critic_loss = self.critic_loss_fn(
-            gt_classifier_logits,
-            gen_classifier_logits,
-            sequence_selection=self.args.classifier_sequence_selection,
-        )
-
-        critic_classifier_loss = self.args.critic_classifier_loss_coef * critic_loss
-        critic_direct_discrepancy_loss = torch.zeros((), device=device, dtype=critic_classifier_loss.dtype)
-
-        direct_discrepancy_coef = float(getattr(self.args, "critic_direct_discrepancy_coef", 0.0) or 0.0)
-        direct_discrepancy_target = getattr(self.args, "critic_direct_discrepancy_target", "ema_gt")
-        if direct_discrepancy_coef > 0.0 and getattr(self.args, "distribution_reward_type", "pointwise") == "cf_l1oo":
-            # INSTRUMENTATION: 第一次进入 discrepancy 分支时的运行时状态
-            if not hasattr(self, '_instrumentation_printed'):
-                self._instrumentation_printed = True
-                import torch.distributed as dist
-                is_rank0 = not dist.is_initialized() or dist.get_rank() == 0
-                if is_rank0:
-                    print("\n" + "="*80)
-                    print("[G3 INSTRUMENTATION] First entry into discrepancy path")
-                    print("="*80)
-                    print(f"  full_sequences.shape: {full_sequences.shape}")
-                    print(f"  qa_masks.shape: {qa_masks.shape}")
-                    print(f"  prompt_length: {prompt_length}")
-                    print(f"  context_length: {context_length}")
-                    print(f"  generate_max_len: {generate_max_len}")
-                    print(f"  stride: {stride}")
-                    print(f"  num_blocks: {num_blocks}")
-                    print(f"  gt_hidden_states.shape: {gt_hidden_states.shape}")
-                    print(f"  gen_hidden_states.shape: {gen_hidden_states.shape}")
-                    print(f"  direct_discrepancy_target: {direct_discrepancy_target}")
-                    print(f"  ema_model is None: {self.ema_model is None}")
-                    print("="*80 + "\n")
-            
-            num_feat = gt_hidden_states.shape[-2]
-            gt_mask_flat = qa_masks[:, context_length:prompt_length].view(batch_size, prompt_length - context_length, 1, 1).repeat(1, 1, num_feat, 1)
-            gen_mask_flat = qa_masks[:, prompt_length:].view(batch_size, generate_max_len * num_blocks, 1, 1).repeat(1, 1, num_feat, 1)
-            gt_mask = gt_mask_flat.unfold(-3, generate_max_len, stride).permute(0, 1, 4, 2, 3)
-            gen_mask = gen_mask_flat.reshape(batch_size, generate_max_len, num_blocks, num_feat, 1).transpose(-3, -4)
-
-            target_gt_hidden_states = gt_hidden_states.detach()
-            target_gt_mask = gt_mask
-            if direct_discrepancy_target == "ema_gt" and self.ema_model is not None:
-                with torch.no_grad():
-                    ema_gt_hidden_states, _, _, _, _ = self.ema_model(
-                        full_sequences.to(device),
-                        attention_mask.to(device),
-                        pos_ids.to(device),
-                        return_classifier_logits=True,
-                        context_length=context_length,
-                        prompt_length=prompt_length,
-                        generate_max_len=generate_max_len,
-                        stride=stride,
-                        num_blocks=num_blocks,
-                        hidden_state_method=self.args.hidden_state_method,
-                        qa_masks=qa_masks.to(device),
-                        qa_masking=self.args.qa_masking,
-                    )
-                target_gt_hidden_states = ema_gt_hidden_states.detach()
+            direct_discrepancy_coef = float(getattr(self.args, "critic_direct_discrepancy_coef", 0.0) or 0.0)
+            direct_discrepancy_target = getattr(self.args, "critic_direct_discrepancy_target", "ema_gt")
+            if direct_discrepancy_coef > 0.0 and getattr(self.args, "distribution_reward_type", "pointwise") == "cf_l1oo":
+                # INSTRUMENTATION: 第一次进入 discrepancy 分支时的运行时状态
+                if not hasattr(self, '_instrumentation_printed'):
+                    self._instrumentation_printed = True
+                    import torch.distributed as dist
+                    is_rank0 = not dist.is_initialized() or dist.get_rank() == 0
+                    if is_rank0:
+                        print("\n" + "="*80)
+                        print("[G3 INSTRUMENTATION] First entry into discrepancy path")
+                        print("="*80)
+                        print(f"  full_sequences.shape: {full_sequences.shape}")
+                        print(f"  qa_masks.shape: {qa_masks.shape}")
+                        print(f"  prompt_length: {prompt_length}")
+                        print(f"  context_length: {context_length}")
+                        print(f"  generate_max_len: {generate_max_len}")
+                        print(f"  stride: {stride}")
+                        print(f"  num_blocks: {num_blocks}")
+                        print(f"  gt_hidden_states.shape: {gt_hidden_states.shape}")
+                        print(f"  gen_hidden_states.shape: {gen_hidden_states.shape}")
+                        print(f"  direct_discrepancy_target: {direct_discrepancy_target}")
+                        print(f"  ema_model is None: {self.ema_model is None}")
+                        print("="*80 + "\n")
                 
-                # INSTRUMENTATION: EMA 调用后的状态
+                num_feat = gt_hidden_states.shape[-2]
+                gt_mask_flat = qa_masks[:, context_length:prompt_length].view(batch_size, prompt_length - context_length, 1, 1).repeat(1, 1, num_feat, 1)
+                gen_mask_flat = qa_masks[:, prompt_length:].view(batch_size, generate_max_len * num_blocks, 1, 1).repeat(1, 1, num_feat, 1)
+                gt_mask = gt_mask_flat.unfold(-3, generate_max_len, stride).permute(0, 1, 4, 2, 3)
+                gen_mask = gen_mask_flat.reshape(batch_size, generate_max_len, num_blocks, num_feat, 1).transpose(-3, -4)
+
+                target_gt_hidden_states = gt_hidden_states.detach()
+                target_gt_mask = gt_mask
+                if direct_discrepancy_target == "ema_gt" and self.ema_model is not None:
+                    with torch.no_grad():
+                        ema_gt_hidden_states, _, _, _, _ = self.ema_model(
+                            full_sequences.to(device),
+                            attention_mask.to(device),
+                            pos_ids.to(device),
+                            return_classifier_logits=True,
+                            context_length=context_length,
+                            prompt_length=prompt_length,
+                            generate_max_len=generate_max_len,
+                            stride=stride,
+                            num_blocks=num_blocks,
+                            hidden_state_method=self.args.hidden_state_method,
+                            qa_masks=qa_masks.to(device),
+                            qa_masking=self.args.qa_masking,
+                        )
+                    target_gt_hidden_states = ema_gt_hidden_states.detach()
+                    
+                    # INSTRUMENTATION: EMA 调用后的状态
+                    import torch.distributed as dist
+                    is_rank0 = not dist.is_initialized() or dist.get_rank() == 0
+                    if is_rank0 and hasattr(self, '_instrumentation_printed'):
+                        print("\n" + "="*80)
+                        print("[G3 INSTRUMENTATION] After EMA model forward")
+                        print("="*80)
+                        print(f"  target_gt_hidden_states.shape: {target_gt_hidden_states.shape}")
+                        print(f"  target_gt_hidden_states.dtype: {target_gt_hidden_states.dtype}")
+                        print(f"  target_gt_hidden_states device: {target_gt_hidden_states.device}")
+                        print("="*80 + "\n")
+
+                target_gt_embedding, online_gen_embedding = prepare_distribution_embeddings_from_split_hidden_states(
+                    gt_hidden_states=target_gt_hidden_states,
+                    gen_hidden_states=gen_hidden_states,
+                    gt_qa_mask=target_gt_mask,
+                    gen_qa_mask=gen_mask,
+                    n_samples_per_prompt=self.args.n_samples_per_prompt,
+                    embed_method=self.args.embed_method,
+                    use_whitening=self.args.use_whitening,
+                    feature_map_type=getattr(self.args, "feature_map_type", "identity"),
+                    rff_num_features=getattr(self.args, "rff_num_features", 128),
+                    rff_sigma=getattr(self.args, "rff_sigma", 1.0),
+                    rff_seed=getattr(self.args, "rff_seed", 43),
+                    qa_masking=self.args.qa_masking,
+                )
+                # INSTRUMENTATION: embedding 准备后的状态
                 import torch.distributed as dist
                 is_rank0 = not dist.is_initialized() or dist.get_rank() == 0
                 if is_rank0 and hasattr(self, '_instrumentation_printed'):
                     print("\n" + "="*80)
-                    print("[G3 INSTRUMENTATION] After EMA model forward")
+                    print("[G3 INSTRUMENTATION] After prepare_distribution_embeddings")
                     print("="*80)
-                    print(f"  target_gt_hidden_states.shape: {target_gt_hidden_states.shape}")
-                    print(f"  target_gt_hidden_states.dtype: {target_gt_hidden_states.dtype}")
-                    print(f"  target_gt_hidden_states device: {target_gt_hidden_states.device}")
+                    print(f"  target_gt_embedding.shape: {target_gt_embedding.shape}")
+                    print(f"  online_gen_embedding.shape: {online_gen_embedding.shape}")
+                    print(f"  shapes match: {target_gt_embedding.shape == online_gen_embedding.shape}")
                     print("="*80 + "\n")
+                
+                critic_direct_discrepancy_loss = direct_discrepancy_coef * compute_cf_discrepancy_loss(
+                    online_gen_embedding,
+                    target_gt_embedding.detach(),
+                    cf_num_freqs=getattr(self.args, "cf_num_freqs", 128),
+                    cf_sigma=getattr(self.args, "cf_sigma", 1.0),
+                    cf_seed=getattr(self.args, "cf_seed", 43),
+                    cf_alpha=getattr(self.args, "cf_alpha", 0.5),
+                    cf_beta=getattr(self.args, "cf_beta", 0.5),
+                    cf_target_mode="single",
+                    cf_target_num_refs=1,
+                    cf_target_std=getattr(self.args, "cf_target_std", 0.05),
+                    cf_target_seed=getattr(self.args, "cf_target_seed", 43),
+                )
 
-            target_gt_embedding, online_gen_embedding = prepare_distribution_embeddings_from_split_hidden_states(
-                gt_hidden_states=target_gt_hidden_states,
-                gen_hidden_states=gen_hidden_states,
-                gt_qa_mask=target_gt_mask,
-                gen_qa_mask=gen_mask,
-                n_samples_per_prompt=self.args.n_samples_per_prompt,
-                embed_method=self.args.embed_method,
-                use_whitening=self.args.use_whitening,
-                feature_map_type=getattr(self.args, "feature_map_type", "identity"),
-                rff_num_features=getattr(self.args, "rff_num_features", 128),
-                rff_sigma=getattr(self.args, "rff_sigma", 1.0),
-                rff_seed=getattr(self.args, "rff_seed", 43),
-                qa_masking=self.args.qa_masking,
-            )
-            # INSTRUMENTATION: embedding 准备后的状态
-            import torch.distributed as dist
-            is_rank0 = not dist.is_initialized() or dist.get_rank() == 0
-            if is_rank0 and hasattr(self, '_instrumentation_printed'):
-                print("\n" + "="*80)
-                print("[G3 INSTRUMENTATION] After prepare_distribution_embeddings")
-                print("="*80)
-                print(f"  target_gt_embedding.shape: {target_gt_embedding.shape}")
-                print(f"  online_gen_embedding.shape: {online_gen_embedding.shape}")
-                print(f"  shapes match: {target_gt_embedding.shape == online_gen_embedding.shape}")
-                print("="*80 + "\n")
-            
-            critic_direct_discrepancy_loss = direct_discrepancy_coef * compute_cf_discrepancy_loss(
-                online_gen_embedding,
-                target_gt_embedding.detach(),
-                cf_num_freqs=getattr(self.args, "cf_num_freqs", 128),
-                cf_sigma=getattr(self.args, "cf_sigma", 1.0),
-                cf_seed=getattr(self.args, "cf_seed", 43),
-                cf_alpha=getattr(self.args, "cf_alpha", 0.5),
-                cf_beta=getattr(self.args, "cf_beta", 0.5),
-                cf_target_mode="single",
-                cf_target_num_refs=1,
-                cf_target_std=getattr(self.args, "cf_target_std", 0.05),
-                cf_target_seed=getattr(self.args, "cf_target_seed", 43),
-            )
+            critic_loss = critic_classifier_loss + critic_direct_discrepancy_loss
 
-        critic_loss = critic_classifier_loss + critic_direct_discrepancy_loss
-
-        if self.args.use_dynamic_batch:
-            critic_loss = critic_loss * self.replay_buffer.dynamic_loss_scale[step]
-
-        if train_critic:
-            self.strategy.backward(critic_loss, self.critic, self.critic_optim)
-
-
-        if train_critic and self.ema_model:
             if self.args.use_dynamic_batch:
-                if self.replay_buffer.dynamic_optimizer_step[step]:
-                    self.strategy.moving_average(self.critic, self.ema_model, self.ema_beta, "cuda")
-            else:
-                self.strategy.moving_average(self.critic, self.ema_model, self.ema_beta, "cuda")
+                critic_loss = critic_loss * self.replay_buffer.dynamic_loss_scale[step]
 
+            if train_critic:
+                self.strategy.backward(critic_loss, self.critic, self.critic_optim)
 
-
-        grad_norm_value: Optional[float] = None
-        if getattr(self.args, "log_gradients", False):
-            should_log = True
-            if self.args.use_dynamic_batch:
-                should_log = bool(self.replay_buffer.dynamic_optimizer_step[step])
-
-            if should_log:
-                if train_critic:
-                    grad_norm_value = self._compute_critic_grad_norm()
+            if train_critic and self.ema_model:
+                if self.args.use_dynamic_batch:
+                    if self.replay_buffer.dynamic_optimizer_step[step]:
+                        self.strategy.moving_average(self.critic, self.ema_model, self.ema_beta, "cuda")
                 else:
-                    grad_norm_value = 0
-       
-        if train_critic:
-            if self.args.use_dynamic_batch:
-                if self.replay_buffer.dynamic_optimizer_step[step]:
+                    self.strategy.moving_average(self.critic, self.ema_model, self.ema_beta, "cuda")
+
+            if getattr(self.args, "log_gradients", False):
+                should_log = True
+                if self.args.use_dynamic_batch:
+                    should_log = bool(self.replay_buffer.dynamic_optimizer_step[step])
+
+                if should_log:
+                    if train_critic:
+                        grad_norm_value = self._compute_critic_grad_norm()
+                    else:
+                        grad_norm_value = 0
+        
+            if train_critic:
+                if self.args.use_dynamic_batch:
+                    if self.replay_buffer.dynamic_optimizer_step[step]:
+                        self.strategy.optimizer_step(self.critic_optim, self.critic, self.critic_scheduler, name="critic")
+                else:
                     self.strategy.optimizer_step(self.critic_optim, self.critic, self.critic_scheduler, name="critic")
-            else:
-                self.strategy.optimizer_step(self.critic_optim, self.critic, self.critic_scheduler, name="critic")
+        finally:
+            if restore_attention_impl is not None:
+                self.critic.set_attention_implementation(restore_attention_impl)
 
         # Get post-step metrics (using EMA model if available, otherwise current critic)
         with torch.no_grad():
             _post_model = self.ema_model if self.ema_model else self.critic
-            _, _, gt_classifier_logits, gen_classifier_logits, _ = _post_model(
-                full_sequences.to(device),
-                attention_mask.to(device),
-                pos_ids.to(device),
-                return_classifier_logits=True,
-                context_length=context_length,
-                prompt_length=prompt_length,
-                generate_max_len=generate_max_len,
-                stride=stride,
-                num_blocks=num_blocks,
-                hidden_state_method=self.args.hidden_state_method,
-                qa_masks=qa_masks.to(device),
-                qa_masking=self.args.qa_masking,
-            )
+            restore_post_attention_impl = _maybe_override_attention_impl(_post_model)
+            try:
+                _, _, gt_classifier_logits, gen_classifier_logits, _ = _post_model(
+                    full_sequences.to(device),
+                    attention_mask.to(device),
+                    pos_ids.to(device),
+                    return_classifier_logits=True,
+                    context_length=context_length,
+                    prompt_length=prompt_length,
+                    generate_max_len=generate_max_len,
+                    stride=stride,
+                    num_blocks=num_blocks,
+                    hidden_state_method=self.args.hidden_state_method,
+                    qa_masks=qa_masks.to(device),
+                    qa_masking=self.args.qa_masking,
+                )
+            finally:
+                if restore_post_attention_impl is not None:
+                    _post_model.set_attention_implementation(restore_post_attention_impl)
 
             if self.args.critic_sequence_level == "token":
                 gt_classifier_logits = gt_classifier_logits.reshape(batch_size // self.args.n_samples_per_prompt, self.args.n_samples_per_prompt, num_blocks, generate_max_len, gt_classifier_logits.shape[-1])
