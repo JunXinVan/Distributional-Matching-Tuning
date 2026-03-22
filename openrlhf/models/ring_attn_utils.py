@@ -1,9 +1,23 @@
 import torch
 import torch.distributed as dist
-from flash_attn.bert_padding import index_first_axis, pad_input, rearrange, unpad_input
-from flash_attn.utils.distributed import all_gather
+
+try:
+    from flash_attn.bert_padding import index_first_axis, pad_input, rearrange, unpad_input
+    from flash_attn.utils.distributed import all_gather
+    _FLASH_ATTN_IMPORT_ERROR = None
+except ModuleNotFoundError as exc:
+    index_first_axis = pad_input = rearrange = unpad_input = all_gather = None
+    _FLASH_ATTN_IMPORT_ERROR = exc
 
 RING_ATTN_GROUP = None
+
+
+def _require_flash_attn():
+    if _FLASH_ATTN_IMPORT_ERROR is not None:
+        raise ModuleNotFoundError(
+            "flash_attn is required for packed samples or ring attention paths. "
+            "Install flash-attn or run without --packing_samples / ring attention."
+        ) from _FLASH_ATTN_IMPORT_ERROR
 
 
 def set_ring_attn_group(group):
@@ -48,6 +62,7 @@ def update_ring_attn_params(cu_seqlens):
     Note that total_seq_len may be larger than the sum of packed_seq_lens because of padding.
     """
     assert RING_ATTN_GROUP is not None
+    _require_flash_attn()
 
     from ring_flash_attn import update_ring_flash_attn_params
 
@@ -111,6 +126,7 @@ def unpad_and_slice_tensor(sequences, attention_mask, ring_attn_group):
     Returns:
         tuple: Processed sequences and related tensors for ring attention
     """
+    _require_flash_attn()
     rolled_sequences = torch.roll(sequences, shifts=-1, dims=1)
     sequences, indices, cu_seqlens, _, _ = unpad_input(sequences.unsqueeze(-1), attention_mask)
     sequences = sequences.transpose(0, 1)  # (1, total_seqs)
@@ -159,6 +175,7 @@ def gather_and_pad_tensor(tensor, ring_attn_group, ring_attn_pad_len, indices, b
     Returns:
         Padded tensor
     """
+    _require_flash_attn()
     if ring_attn_group is not None:
         tensor = all_gather(tensor.transpose(0, 1), ring_attn_group).transpose(0, 1)  # (1, total_seqs)
         if ring_attn_pad_len > 0:

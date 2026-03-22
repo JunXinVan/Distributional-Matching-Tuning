@@ -15,6 +15,10 @@ from transformers.trainer import get_scheduler
 from openrlhf.models import Critic, ClassifierLoss, ClassifierAccuracy, CELoss
 from openrlhf.models.utils import build_strided_attention_mask_and_positions, masked_mean
 from openrlhf.trainer.ppo_utils.experience_maker import Experience
+from openrlhf.utils.embedding_utils import (
+    compute_cf_discrepancy_loss,
+    prepare_distribution_embeddings_from_split_hidden_states,
+)
 from openrlhf.utils import get_tokenizer
 from openrlhf.utils.logging_utils import init_logger
 from openrlhf.utils.deepspeed import DeepspeedStrategy
@@ -72,6 +76,7 @@ class CriticEBFTTrainer(ABC):
 
         # Mixtral 8x7b
         self.aux_loss = self.args.aux_loss_coef > 1e-8
+        self._feature_adapter_init = self._snapshot_named_params(self.critic, "feature_adapter")
 
     def ppo_train(self):
         # replay buffer may be empty at first, we should rebuild at each training
@@ -171,7 +176,7 @@ class CriticEBFTTrainer(ABC):
         # This saves memory/compute when critic LR is 0.
         _forward_ctx = nullcontext() if train_critic else torch.no_grad()
         with _forward_ctx:
-            _, _, gt_classifier_logits, gen_classifier_logits, _ = self.critic(
+            gt_hidden_states, gen_hidden_states, gt_classifier_logits, gen_classifier_logits, _ = self.critic(
                 full_sequences.to(device),
                 attention_mask.to(device),
                 pos_ids.to(device),
@@ -216,7 +221,113 @@ class CriticEBFTTrainer(ABC):
             sequence_selection=self.args.classifier_sequence_selection,
         )
 
-        critic_loss = self.args.critic_classifier_loss_coef * critic_loss
+        critic_classifier_loss = self.args.critic_classifier_loss_coef * critic_loss
+        critic_direct_discrepancy_loss = torch.zeros((), device=device, dtype=critic_classifier_loss.dtype)
+
+        direct_discrepancy_coef = float(getattr(self.args, "critic_direct_discrepancy_coef", 0.0) or 0.0)
+        direct_discrepancy_target = getattr(self.args, "critic_direct_discrepancy_target", "ema_gt")
+        if direct_discrepancy_coef > 0.0 and getattr(self.args, "distribution_reward_type", "pointwise") == "cf_l1oo":
+            # INSTRUMENTATION: 第一次进入 discrepancy 分支时的运行时状态
+            if not hasattr(self, '_instrumentation_printed'):
+                self._instrumentation_printed = True
+                import torch.distributed as dist
+                is_rank0 = not dist.is_initialized() or dist.get_rank() == 0
+                if is_rank0:
+                    print("\n" + "="*80)
+                    print("[G3 INSTRUMENTATION] First entry into discrepancy path")
+                    print("="*80)
+                    print(f"  full_sequences.shape: {full_sequences.shape}")
+                    print(f"  qa_masks.shape: {qa_masks.shape}")
+                    print(f"  prompt_length: {prompt_length}")
+                    print(f"  context_length: {context_length}")
+                    print(f"  generate_max_len: {generate_max_len}")
+                    print(f"  stride: {stride}")
+                    print(f"  num_blocks: {num_blocks}")
+                    print(f"  gt_hidden_states.shape: {gt_hidden_states.shape}")
+                    print(f"  gen_hidden_states.shape: {gen_hidden_states.shape}")
+                    print(f"  direct_discrepancy_target: {direct_discrepancy_target}")
+                    print(f"  ema_model is None: {self.ema_model is None}")
+                    print("="*80 + "\n")
+            
+            num_feat = gt_hidden_states.shape[-2]
+            gt_mask_flat = qa_masks[:, context_length:prompt_length].view(batch_size, prompt_length - context_length, 1, 1).repeat(1, 1, num_feat, 1)
+            gen_mask_flat = qa_masks[:, prompt_length:].view(batch_size, generate_max_len * num_blocks, 1, 1).repeat(1, 1, num_feat, 1)
+            gt_mask = gt_mask_flat.unfold(-3, generate_max_len, stride).permute(0, 1, 4, 2, 3)
+            gen_mask = gen_mask_flat.reshape(batch_size, generate_max_len, num_blocks, num_feat, 1).transpose(-3, -4)
+
+            target_gt_hidden_states = gt_hidden_states.detach()
+            target_gt_mask = gt_mask
+            if direct_discrepancy_target == "ema_gt" and self.ema_model is not None:
+                with torch.no_grad():
+                    ema_gt_hidden_states, _, _, _, _ = self.ema_model(
+                        full_sequences.to(device),
+                        attention_mask.to(device),
+                        pos_ids.to(device),
+                        return_classifier_logits=True,
+                        context_length=context_length,
+                        prompt_length=prompt_length,
+                        generate_max_len=generate_max_len,
+                        stride=stride,
+                        num_blocks=num_blocks,
+                        hidden_state_method=self.args.hidden_state_method,
+                        qa_masks=qa_masks.to(device),
+                        qa_masking=self.args.qa_masking,
+                    )
+                target_gt_hidden_states = ema_gt_hidden_states.detach()
+                
+                # INSTRUMENTATION: EMA 调用后的状态
+                import torch.distributed as dist
+                is_rank0 = not dist.is_initialized() or dist.get_rank() == 0
+                if is_rank0 and hasattr(self, '_instrumentation_printed'):
+                    print("\n" + "="*80)
+                    print("[G3 INSTRUMENTATION] After EMA model forward")
+                    print("="*80)
+                    print(f"  target_gt_hidden_states.shape: {target_gt_hidden_states.shape}")
+                    print(f"  target_gt_hidden_states.dtype: {target_gt_hidden_states.dtype}")
+                    print(f"  target_gt_hidden_states device: {target_gt_hidden_states.device}")
+                    print("="*80 + "\n")
+
+            target_gt_embedding, online_gen_embedding = prepare_distribution_embeddings_from_split_hidden_states(
+                gt_hidden_states=target_gt_hidden_states,
+                gen_hidden_states=gen_hidden_states,
+                gt_qa_mask=target_gt_mask,
+                gen_qa_mask=gen_mask,
+                n_samples_per_prompt=self.args.n_samples_per_prompt,
+                embed_method=self.args.embed_method,
+                use_whitening=self.args.use_whitening,
+                feature_map_type=getattr(self.args, "feature_map_type", "identity"),
+                rff_num_features=getattr(self.args, "rff_num_features", 128),
+                rff_sigma=getattr(self.args, "rff_sigma", 1.0),
+                rff_seed=getattr(self.args, "rff_seed", 43),
+                qa_masking=self.args.qa_masking,
+            )
+            # INSTRUMENTATION: embedding 准备后的状态
+            import torch.distributed as dist
+            is_rank0 = not dist.is_initialized() or dist.get_rank() == 0
+            if is_rank0 and hasattr(self, '_instrumentation_printed'):
+                print("\n" + "="*80)
+                print("[G3 INSTRUMENTATION] After prepare_distribution_embeddings")
+                print("="*80)
+                print(f"  target_gt_embedding.shape: {target_gt_embedding.shape}")
+                print(f"  online_gen_embedding.shape: {online_gen_embedding.shape}")
+                print(f"  shapes match: {target_gt_embedding.shape == online_gen_embedding.shape}")
+                print("="*80 + "\n")
+            
+            critic_direct_discrepancy_loss = direct_discrepancy_coef * compute_cf_discrepancy_loss(
+                online_gen_embedding,
+                target_gt_embedding.detach(),
+                cf_num_freqs=getattr(self.args, "cf_num_freqs", 128),
+                cf_sigma=getattr(self.args, "cf_sigma", 1.0),
+                cf_seed=getattr(self.args, "cf_seed", 43),
+                cf_alpha=getattr(self.args, "cf_alpha", 0.5),
+                cf_beta=getattr(self.args, "cf_beta", 0.5),
+                cf_target_mode="single",
+                cf_target_num_refs=1,
+                cf_target_std=getattr(self.args, "cf_target_std", 0.05),
+                cf_target_seed=getattr(self.args, "cf_target_seed", 43),
+            )
+
+        critic_loss = critic_classifier_loss + critic_direct_discrepancy_loss
 
         if self.args.use_dynamic_batch:
             critic_loss = critic_loss * self.replay_buffer.dynamic_loss_scale[step]
@@ -289,9 +400,47 @@ class CriticEBFTTrainer(ABC):
             post_classifier_pred_pos_frac = post_metrics[8]
             post_classifier_acc_thresh0p5 = post_metrics[9]
             critic_logit_exact_match = torch.mean((gt_classifier_logits == gen_classifier_logits).float())
+        last_lrs = self.critic_scheduler.get_last_lr()
+        if len(last_lrs) == 0:
+            critic_lr_backbone = 0.0
+            critic_lr_head = 0.0
+        elif len(last_lrs) == 1:
+            # Adapter-only / frozen-backbone runs can collapse to a single scheduler LR entry.
+            critic_lr_backbone = 0.0
+            critic_lr_head = last_lrs[0]
+        else:
+            critic_lr_backbone = last_lrs[0]
+            critic_lr_head = last_lrs[1]
+
+        optimizer_lrs = [float(group.get("lr", 0.0)) for group in getattr(self.critic_optim, "param_groups", [])]
+        if len(optimizer_lrs) == 0:
+            critic_opt_lr_group0 = 0.0
+            critic_opt_lr_group1 = 0.0
+        elif len(optimizer_lrs) == 1:
+            critic_opt_lr_group0 = 0.0
+            critic_opt_lr_group1 = optimizer_lrs[0]
+        else:
+            critic_opt_lr_group0 = optimizer_lrs[0]
+            critic_opt_lr_group1 = optimizer_lrs[1]
+
+        feature_adapter_drift_abs_mean, feature_adapter_drift_rel_l2 = self._compute_param_drift(
+            self.critic, self._feature_adapter_init, "feature_adapter"
+        )
+        feature_adapter_up_drift_abs_mean, feature_adapter_up_drift_rel_l2 = self._compute_param_drift(
+            self.critic, self._feature_adapter_init, "up_proj"
+        )
+        feature_adapter_down_drift_abs_mean, feature_adapter_down_drift_rel_l2 = self._compute_param_drift(
+            self.critic, self._feature_adapter_init, "down_proj"
+        )
+        feature_adapter_ema_gap_abs_mean, feature_adapter_ema_gap_rel_l2 = self._compute_ema_gap(
+            self.critic, self.ema_model, "feature_adapter"
+        )
+
         status = {
             "train_critic": train_critic,
             "critic_loss": critic_loss.detach().item(),
+            "critic_classifier_loss": critic_classifier_loss.detach().item(),
+            "critic_direct_discrepancy_loss": critic_direct_discrepancy_loss.detach().item(),
             "critic_classifier_accuracy_before": prev_classifier_accuracy.detach().item(),
             "critic_classifier_accuracy_after": post_classifier_accuracy.detach().item(),
             "critic_classifier_precision_before": prev_classifier_precision.detach().item(),
@@ -313,14 +462,94 @@ class CriticEBFTTrainer(ABC):
             "critic_classifier_acc_thresh0p5_before": prev_classifier_acc_thresh0p5.detach().item(),
             "critic_classifier_acc_thresh0p5_after": post_classifier_acc_thresh0p5.detach().item(),
             "critic_logit_exact_match": critic_logit_exact_match.detach().item(),
-            "critic_lr_backbone": self.critic_scheduler.get_last_lr()[0],
-            "critic_lr_head": self.critic_scheduler.get_last_lr()[1],
+            "critic_lr_backbone": critic_lr_backbone,
+            "critic_lr_head": critic_lr_head,
+            "critic_opt_lr_group0": critic_opt_lr_group0,
+            "critic_opt_lr_group1": critic_opt_lr_group1,
+            "feature_adapter_drift_abs_mean": feature_adapter_drift_abs_mean,
+            "feature_adapter_drift_rel_l2": feature_adapter_drift_rel_l2,
+            "feature_adapter_up_drift_abs_mean": feature_adapter_up_drift_abs_mean,
+            "feature_adapter_up_drift_rel_l2": feature_adapter_up_drift_rel_l2,
+            "feature_adapter_down_drift_abs_mean": feature_adapter_down_drift_abs_mean,
+            "feature_adapter_down_drift_rel_l2": feature_adapter_down_drift_rel_l2,
+            "feature_adapter_ema_gap_abs_mean": feature_adapter_ema_gap_abs_mean,
+            "feature_adapter_ema_gap_rel_l2": feature_adapter_ema_gap_rel_l2,
         }
         if grad_norm_value is not None:
             status["critic_grad_norm"] = grad_norm_value
         else:
             status["critic_grad_norm"] = 0.0
         return status
+
+    @staticmethod
+    def _normalize_param_name(name: str) -> str:
+        while name.startswith("module."):
+            name = name[len("module.") :]
+        return name
+
+    def _snapshot_named_params(self, model, needle: str) -> Dict[str, torch.Tensor]:
+        snapshot: Dict[str, torch.Tensor] = {}
+        if model is None:
+            return snapshot
+        with torch.no_grad():
+            for name, param in model.named_parameters():
+                norm_name = self._normalize_param_name(name)
+                if needle in norm_name:
+                    snapshot[norm_name] = param.detach().float().cpu().clone()
+        return snapshot
+
+    def _compute_param_drift(self, model, snapshot: Dict[str, torch.Tensor], needle: str) -> tuple[float, float]:
+        if model is None or not snapshot:
+            return 0.0, 0.0
+
+        delta_sq = 0.0
+        base_sq = 0.0
+        abs_mean_acc = 0.0
+        count = 0
+        with torch.no_grad():
+            for name, param in model.named_parameters():
+                norm_name = self._normalize_param_name(name)
+                if needle not in norm_name or norm_name not in snapshot:
+                    continue
+                current = param.detach().float().cpu()
+                base = snapshot[norm_name]
+                diff = current - base
+                delta_sq += float(diff.pow(2).sum().item())
+                base_sq += float(base.pow(2).sum().item())
+                abs_mean_acc += float(diff.abs().mean().item())
+                count += 1
+        if count == 0:
+            return 0.0, 0.0
+        abs_mean = abs_mean_acc / count
+        rel_l2 = math.sqrt(delta_sq) / (math.sqrt(base_sq) + 1e-12)
+        return abs_mean, rel_l2
+
+    def _compute_ema_gap(self, online_model, ema_model, needle: str) -> tuple[float, float]:
+        if online_model is None or ema_model is None:
+            return 0.0, 0.0
+        online_params = self._snapshot_named_params(online_model, needle)
+        ema_params = self._snapshot_named_params(ema_model, needle)
+        if not online_params or not ema_params:
+            return 0.0, 0.0
+
+        delta_sq = 0.0
+        online_sq = 0.0
+        abs_mean_acc = 0.0
+        count = 0
+        for name, online in online_params.items():
+            if name not in ema_params:
+                continue
+            ema = ema_params[name]
+            diff = online - ema
+            delta_sq += float(diff.pow(2).sum().item())
+            online_sq += float(online.pow(2).sum().item())
+            abs_mean_acc += float(diff.abs().mean().item())
+            count += 1
+        if count == 0:
+            return 0.0, 0.0
+        abs_mean = abs_mean_acc / count
+        rel_l2 = math.sqrt(delta_sq) / (math.sqrt(online_sq) + 1e-12)
+        return abs_mean, rel_l2
 
     def _compute_critic_grad_norm(self) -> Optional[float]:
         """Return the global gradient norm of the critic, handling ZeRO stages gracefully."""
@@ -392,6 +621,10 @@ class EBFTCriticModelActor(BaseModelActor):
             critic_sequence_level=getattr(strategy.args, "critic_sequence_level", "token"),
             gen_len=getattr(strategy.args, "generate_max_len", None),
             hidden_state_method=getattr(strategy.args, "hidden_state_method", "last_only"),
+            feature_adapter_enable=getattr(strategy.args, "feature_adapter_enable", False),
+            feature_adapter_type=getattr(strategy.args, "feature_adapter_type", "residual_bottleneck"),
+            feature_adapter_rank=getattr(strategy.args, "feature_adapter_rank", 64),
+            feature_adapter_dropout=getattr(strategy.args, "feature_adapter_dropout", 0.0),
         )
         # configure tokenizer
         if strategy.args.save_value_network:
@@ -417,6 +650,10 @@ class EBFTCriticModelActor(BaseModelActor):
                 critic_sequence_level=getattr(strategy.args, "critic_sequence_level", "token"),
                 gen_len=getattr(strategy.args, "generate_max_len", None),
                 hidden_state_method=getattr(strategy.args, "hidden_state_method", "last_only"),
+                feature_adapter_enable=getattr(strategy.args, "feature_adapter_enable", False),
+                feature_adapter_type=getattr(strategy.args, "feature_adapter_type", "residual_bottleneck"),
+                feature_adapter_rank=getattr(strategy.args, "feature_adapter_rank", 64),
+                feature_adapter_dropout=getattr(strategy.args, "feature_adapter_dropout", 0.0),
             )
         else:
             ema_model = None

@@ -29,6 +29,7 @@ from openrlhf.utils.embedding_utils import (
 )
 from datasets import load_dataset
 from datasets import concatenate_datasets
+from datatrove.utils.dataset import DatatroveFolderDataset
 
 logger = init_logger(__name__)
 
@@ -494,7 +495,20 @@ class BaseEBFTTrainer(EBFTEvalMixin, ABC):
         strategy = self.strategy
         
         
-        if len(args.prompt_data.split("/")) > 2:
+        # Check if it's a local HF Dataset directory (contains dataset_dict.json)
+        if os.path.isdir(args.prompt_data) and os.path.exists(os.path.join(args.prompt_data, "dataset_dict.json")):
+            # Local HF Dataset saved with save_to_disk
+            from datasets import load_from_disk
+            train_data = load_from_disk(args.prompt_data)[self.prompt_split]
+            prompts_dataset = QADataset(
+                train_data, 
+                self.tokenizer,
+                strategy,
+                max_samples=args.max_samples,
+                separate_prompt_label=False,
+                seq_len=args.prompt_max_len,
+            )
+        elif len(args.prompt_data.split("/")) > 2 and not args.prompt_data.endswith('.json'):
 
             train_data = DatatroveFolderDataset(
                 folder_path=args.prompt_data,
@@ -502,7 +516,7 @@ class BaseEBFTTrainer(EBFTEvalMixin, ABC):
                 token_size=(2 if self.tokenizer.vocab_size < 65535 else 4),
                 shuffle=True,
                 seed=args.seed,
-                return_positions=False,      # we don’t need them
+                # return_positions=False,      # we don’t need them
             )
             prompts_dataset = SequenceDataset(
                 train_data,
@@ -530,7 +544,7 @@ class BaseEBFTTrainer(EBFTEvalMixin, ABC):
         prompts_dataloader = strategy.setup_dataloader(
             prompts_dataset,
             args.rollout_batch_size,
-            True,
+            self.dataloader_pin_memory,  # Use the configurable pin_memory setting
             True,
             collate_fn=prompts_dataset.collate_fn,
             drop_last=True,
@@ -538,11 +552,15 @@ class BaseEBFTTrainer(EBFTEvalMixin, ABC):
 
         eval_dataloader = None
         eval_downstream_dataloader = None
+        humaneval_dataloader = None
         if getattr(args, "eval_dataset", None):
              # prepare datasets
             if args.eval_dataset == "openai/gsm8k":
                 eval_data = load_dataset(args.eval_dataset, name='main')[self.eval_split]
             elif "swallow_code" in args.eval_dataset:
+                eval_data = blending_datasets(args.eval_dataset, None, strategy, dataset_split=self.eval_split)
+            elif args.eval_dataset.endswith('.jsonl') or args.eval_dataset.endswith('.json') or args.eval_dataset.endswith('.parquet'):
+                # Local file support using blending_datasets
                 eval_data = blending_datasets(args.eval_dataset, None, strategy, dataset_split=self.eval_split)
             else:
                 eval_data = load_dataset(args.eval_dataset)[self.eval_split]

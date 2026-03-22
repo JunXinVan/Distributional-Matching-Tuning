@@ -38,7 +38,13 @@ from openrlhf.utils import get_strategy
 def train(args):
     # initialize ray if not initialized
     if not ray.is_initialized():
-        ray.init(runtime_env={"env_vars": {"TOKENIZERS_PARALLELISM": "true", "NCCL_DEBUG": "WARN"}})
+        ray_kwargs = {
+            "runtime_env": {"env_vars": {"TOKENIZERS_PARALLELISM": "true", "NCCL_DEBUG": "WARN"}}
+        }
+        object_store_memory = os.environ.get("OPENRLHF_RAY_OBJECT_STORE_MEMORY_BYTES")
+        if object_store_memory:
+            ray_kwargs["object_store_memory"] = int(object_store_memory)
+        ray.init(**ray_kwargs)
 
     # configure strategy
     strategy = get_strategy(args)
@@ -165,7 +171,9 @@ def train(args):
     eval_ds = str(getattr(args, "eval_dataset", "") or "").strip().lower()
     eval_down_enabled = int(getattr(args, "eval_down_steps", -1) or -1) != -1 and bool(getattr(args, "eval_dataset", None))
 
-    trainer_needs_gpu = False
+    # Trainer needs GPU if evaluation is enabled (eval requires GPU for model inference)
+    # Also needs GPU when colocate_all_models is True (trainer participates in distributed training)
+    trainer_needs_gpu = bool(args.eval_dataset) or args.eval_steps > 0 or args.colocate_all_models
 
     trainer_options = {}
     if trainer_needs_gpu:
@@ -193,6 +201,7 @@ def train(args):
         eval_split=args.eval_split,
         temperature=args.temperature,
         top_p=args.top_p,
+        dataloader_pin_memory=trainer_needs_gpu,  # Only pin memory if trainer has GPU
     )
     # training update steps
     max_steps = ray.get(ebft_trainer.get_max_steps.remote())
@@ -387,6 +396,136 @@ if __name__ == "__main__":
     parser.add_argument("--use_whitening", action="store_true", default=False, help="Whiten actor reward embeddings")
     parser.add_argument("--dynamic_filtering", action="store_true", default=False, help="Enable dynamic filtering")
     parser.add_argument("--dynamic_filtering_reward_range", nargs=2, default=(0, 1), type=float, help="Reward range for dynamic filtering")
+    parser.add_argument(
+        "--feature_map_type",
+        type=str,
+        default="identity",
+        choices=["identity", "rff"],
+        help="Optional fixed feature map applied before alignment/diversity reward computation",
+    )
+    parser.add_argument(
+        "--rff_num_features",
+        type=int,
+        default=128,
+        help="Output dimension for the fixed random Fourier feature map",
+    )
+    parser.add_argument(
+        "--rff_sigma",
+        type=float,
+        default=1.0,
+        help="Bandwidth scale for the fixed random Fourier feature map",
+    )
+    parser.add_argument(
+        "--rff_seed",
+        type=int,
+        default=43,
+        help="Random seed used to build the fixed random Fourier feature map",
+    )
+    parser.add_argument(
+        "--feature_adapter_enable",
+        action="store_true",
+        help="Enable a small residual bottleneck adapter on top of the critic feature stream",
+    )
+    parser.add_argument(
+        "--feature_adapter_type",
+        type=str,
+        default="residual_bottleneck",
+        choices=["residual_bottleneck"],
+        help="Adapter type used for the feature-network 2-lite geometry adaptation",
+    )
+    parser.add_argument(
+        "--feature_adapter_rank",
+        type=int,
+        default=64,
+        help="Bottleneck rank for the residual feature adapter",
+    )
+    parser.add_argument(
+        "--feature_adapter_dropout",
+        type=float,
+        default=0.0,
+        help="Dropout applied inside the residual feature adapter",
+    )
+    parser.add_argument(
+        "--critic_direct_discrepancy_coef",
+        type=float,
+        default=0.0,
+        help="Auxiliary coefficient for directly discrepancy-driven feature-geometry learning inside critic training",
+    )
+    parser.add_argument(
+        "--critic_direct_discrepancy_target",
+        type=str,
+        default="ema_gt",
+        choices=["ema_gt", "online_stopgrad_gt"],
+        help="Target branch used by the direct discrepancy auxiliary: EMA GT features or stop-gradient online GT features",
+    )
+    parser.add_argument(
+        "--distribution_reward_type",
+        type=str,
+        default="pointwise",
+        choices=["pointwise", "cf_l1oo", "cf_tokencloud_l1oo"],
+        help="How to turn embeddings into sample rewards: vanilla pointwise alignment/diversity, CF leave-one-out distribution matching, or token-cloud CF distribution matching",
+    )
+    parser.add_argument(
+        "--cf_num_freqs",
+        type=int,
+        default=128,
+        help="Number of fixed random frequencies used by the empirical CF discrepancy",
+    )
+    parser.add_argument(
+        "--cf_sigma",
+        type=float,
+        default=1.0,
+        help="Frequency bandwidth scale for the empirical CF discrepancy",
+    )
+    parser.add_argument(
+        "--cf_seed",
+        type=int,
+        default=43,
+        help="Random seed used to build the fixed CF frequencies",
+    )
+    parser.add_argument(
+        "--cf_alpha",
+        type=float,
+        default=0.5,
+        help="Amplitude term weight in the NCFM-style CF discrepancy",
+    )
+    parser.add_argument(
+        "--cf_beta",
+        type=float,
+        default=0.5,
+        help="Phase term weight in the NCFM-style CF discrepancy",
+    )
+    parser.add_argument(
+        "--cf_reward_scale",
+        type=float,
+        default=1.0,
+        help="Scalar multiplier applied to CF marginal rewards",
+    )
+    parser.add_argument(
+        "--cf_target_mode",
+        type=str,
+        default="single",
+        choices=["single", "vicinal"],
+        help="How to build the target empirical measure for CF matching",
+    )
+    parser.add_argument(
+        "--cf_target_num_refs",
+        type=int,
+        default=1,
+        help="Number of target-side reference samples used by the CF discrepancy",
+    )
+    parser.add_argument(
+        "--cf_target_std",
+        type=float,
+        default=0.05,
+        help="Relative smoothing scale used when cf_target_mode=vicinal",
+    )
+    parser.add_argument(
+        "--cf_target_seed",
+        type=int,
+        default=43,
+        help="Random seed used for vicinal target perturbations",
+    )
 
     # Reward composition
     parser.add_argument("--alignment_rew_coef", type=float, default=1.0, help="Weight for embedding alignment reward")
@@ -558,6 +697,29 @@ if __name__ == "__main__":
         args.micro_rollout_batch_size % args.n_samples_per_prompt == 0
     ), f"Micro rollout batch size {args.micro_rollout_batch_size} must be divided by n_samples_per_prompt {args.n_samples_per_prompt}"
 
+    # Strided generation parameter validation
+    if args.generate_max_len >= args.prompt_max_len:
+        raise ValueError(
+            f"generate_max_len ({args.generate_max_len}) must be < prompt_max_len ({args.prompt_max_len})"
+        )
+    
+    # For strided generation: num_blocks = (prompt - generate - context) // stride + 1
+    # To have num_blocks >= 1: prompt_length >= generate_length + context_length
+    if args.prompt_max_len < args.generate_max_len + args.context_max_len:
+        raise ValueError(
+            f"prompt_max_len ({args.prompt_max_len}) must be >= generate_max_len ({args.generate_max_len}) + context_max_len ({args.context_max_len}) "
+            f"to ensure num_blocks >= 1 in strided generation"
+        )
+    
+    remainder = (args.prompt_max_len - args.generate_max_len - args.context_max_len) % args.stride
+    if remainder != 0:
+        raise ValueError(
+            f"(prompt_max_len - generate_max_len - context_max_len) must be divisible by stride, "
+            f"but got ( {args.prompt_max_len} - {args.generate_max_len} - {args.context_max_len} ) = "
+            f"{args.prompt_max_len - args.generate_max_len - args.context_max_len}, "
+            f"remainder {remainder} when divided by stride {args.stride}. "
+            f"Try adjusting stride to one of the divisors."
+        )
 
     if args.use_ms:
         from modelscope.utils.hf_util import patch_hub

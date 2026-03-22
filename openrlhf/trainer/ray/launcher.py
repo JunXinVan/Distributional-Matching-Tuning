@@ -29,7 +29,7 @@ class BaseDistributedActor:
         self._world_size = world_size
         self._rank = rank
         self._master_addr = master_addr if master_addr else self._get_current_node_ip()
-        self._master_port = master_port if master_port else self._get_free_port()
+        self._master_port = master_port if master_port else self._get_free_port(self._get_preferred_port())
         os.environ["MASTER_ADDR"] = self._master_addr
         os.environ["MASTER_PORT"] = str(self._master_port)
         os.environ["WORLD_SIZE"] = str(self._world_size)
@@ -47,7 +47,40 @@ class BaseDistributedActor:
         return address.strip("[]")
 
     @staticmethod
-    def _get_free_port():
+    def _class_port_offsets():
+        return {
+            "ReferenceModelActor": 0,
+            "EBFTReferenceModelActor": 10,
+            "PolicyModelActor": 20,
+            "EBFTPolicyModelActor": 30,
+            "CriticModelActor": 40,
+            "EBFTCriticModelActor": 50,
+            "RewardModelActor": 60,
+            "EBFTCometRewardModelActor": 70,
+            "Trainer": 80,
+            "EBFTTrainer": 90,
+        }
+
+    def _get_preferred_port(self):
+        base_port = 29600
+        class_name = self.__class__.__name__
+        offset = self._class_port_offsets().get(class_name)
+        if offset is not None:
+            return base_port + offset
+        # Stable fallback for other actor classes without relying on process-global hash randomization.
+        return base_port + 100 + (sum(ord(ch) for ch in class_name) % 400)
+
+    @staticmethod
+    def _get_free_port(preferred_port=None):
+        if preferred_port is not None:
+            with socket.socket() as sock:
+                sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                try:
+                    sock.bind(("", preferred_port))
+                    return preferred_port
+                except OSError:
+                    pass
+
         with socket.socket() as sock:
             sock.bind(("", 0))
             return sock.getsockname()[1]

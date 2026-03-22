@@ -169,7 +169,15 @@ class QADataset(Dataset):
         self.seq_len = seq_len
         input_key = getattr(self.strategy.args, "input_key", None)
         label_key = getattr(self.strategy.args, "label_key", None)
-         
+        
+        # Convert max_samples to int early for dataset truncation
+        max_samples = int(max_samples) if max_samples != -1 else -1
+        
+        # Truncate dataset BEFORE preprocessing if max_samples is set
+        if max_samples != -1 and hasattr(dataset, '__len__') and len(dataset) > max_samples:
+            dataset = dataset.select(range(max_samples))
+            if self.strategy.is_rank_0():
+                print(f"[QADataset] Truncated dataset to {max_samples} samples before preprocessing")
 
         self.prompts = []
         self.labels = []
@@ -200,15 +208,18 @@ class QADataset(Dataset):
                 pad_last=True,
                 qa_pairs=qa_pairs,
             )
+        # Secondary truncation after packing (in case packing creates more/less sequences)
         if max_samples != -1:
             if self.separate_prompt_label:
-                self.prompts = self.prompts[:max_samples]
-                self.labels = self.labels[:max_samples]
-                self.datasources = self.datasources[:max_samples]
+                if len(self.prompts) > max_samples:
+                    self.prompts = self.prompts[:max_samples]
+                    self.labels = self.labels[:max_samples]
+                    self.datasources = self.datasources[:max_samples]
             else:
-                self.sequences = self.sequences[:max_samples]
-                self.doc_ids = self.doc_ids[:max_samples]
-                self.answer_masks = self.answer_masks[:max_samples]
+                if len(self.sequences) > max_samples:
+                    self.sequences = self.sequences[:max_samples]
+                    self.doc_ids = self.doc_ids[:max_samples]
+                    self.answer_masks = self.answer_masks[:max_samples]
 
     def __len__(self):
         if self.separate_prompt_label:

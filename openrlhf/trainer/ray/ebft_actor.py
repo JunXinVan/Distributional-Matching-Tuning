@@ -117,6 +117,7 @@ class ActorEBFTTrainer(ABC):
 
                 experience.to_device(device)
                 status = self.training_step(experience, rl_ctl, ce_ctl, kl_ctl, step)
+                status.setdefault("kl", 0.0)
                 status["kl"] *= status["response_length"]
                 status = self.strategy.all_reduce(status)
                 status["kl"] /= status["response_length"]
@@ -146,6 +147,10 @@ class ActorEBFTTrainer(ABC):
         return status_mean
 
     def training_step(self, experience: Experience, rl_ctl: float, ce_ctl: float, kl_ctl: float, step: int) -> Dict[str, float]:
+        # Handle None values from controllers
+        rl_ctl = 1.0 if rl_ctl is None else rl_ctl
+        ce_ctl = 0.0 if ce_ctl is None else ce_ctl
+        kl_ctl = 0.0 if kl_ctl is None else kl_ctl
         self.actor.train()
         device = torch.cuda.current_device()
 
@@ -184,67 +189,86 @@ class ActorEBFTTrainer(ABC):
             document_masking=self.args.document_masking,
         )
 
-        # Compute actor forward pass with strided attention
-        # This calculates the action log probabilities for the full sequence
-        action_log_probs, output = self.actor(
-            full_sequences.to(device),  # Full sequence (prompt + generated)
-            torch.ones_like(action_mask).to(device),  # Action mask for generated tokens
-            attention_mask.to(device),  # Strided attention mask
-            pos_ids=pos_ids,  # Position IDs for proper positional encoding
-            return_logprobs=True,
-            ring_attn_group=self.strategy.ring_attn_group,
-            return_output=True,
-            return_entropy=self.args.entropy_loss_coef is not None,
-            prompt_len=prompt_length,  # Original prompt length
-            context_len=context_length,
-            num_blocks=num_blocks,  # Number of prediction blocks
-            stride=stride,  # Context stride
-        )
+        restore_attention_impl = None
+        if (
+            attention_mask is not None
+            and attention_mask.dim() == 4
+            and getattr(self.args, "gradient_checkpointing", False)
+        ):
+            current_impl = self.actor.get_attention_implementation()
+            if current_impl == "flash_attention_2":
+                # Actor.forward already falls back to eager for dense 4D masks.
+                # With gradient checkpointing, backward recomputation happens after
+                # Actor.forward returns, so the temporary override is gone and HF
+                # re-enters the unsupported FA2 path. Keep the override alive for
+                # the whole forward/backward/step window instead.
+                restore_attention_impl = current_impl
+                self.actor.set_attention_implementation("eager")
 
+        try:
+            # Compute actor forward pass with strided attention
+            # This calculates the action log probabilities for the full sequence
+            action_log_probs, output = self.actor(
+                full_sequences.to(device),  # Full sequence (prompt + generated)
+                torch.ones_like(action_mask).to(device),  # Action mask for generated tokens
+                attention_mask.to(device),  # Strided attention mask
+                pos_ids=pos_ids,  # Position IDs for proper positional encoding
+                return_logprobs=True,
+                ring_attn_group=self.strategy.ring_attn_group,
+                return_output=True,
+                return_entropy=self.args.entropy_loss_coef is not None,
+                prompt_len=prompt_length,  # Original prompt length
+                context_len=context_length,
+                num_blocks=num_blocks,  # Number of prediction blocks
+                stride=stride,  # Context stride
+            )
 
-        # loss function
-        actor_loss, ce_loss = self.actor_loss_fn(
-            action_log_probs,
-            advantages,
-            action_mask=experience.action_mask,
-            qa_masks=qa_masks[:, 1:],
-            qa_masking=self.args.qa_masking,
-        )
+            # loss function
+            actor_loss, ce_loss = self.actor_loss_fn(
+                action_log_probs,
+                advantages,
+                action_mask=experience.action_mask,
+                qa_masks=qa_masks[:, 1:],
+                qa_masking=self.args.qa_masking,
+            )
 
-        
-        if self.args.use_kl_loss:
-            if self.args.init_kl_coef > 0:
-                kl = compute_approx_kl(
-                    action_log_probs,
-                    base_action_log_probs,
-                    kl_estimator=self.args.kl_estimator,
-                )
+            
+            if self.args.use_kl_loss:
+                if self.args.init_kl_coef > 0:
+                    kl = compute_approx_kl(
+                        action_log_probs,
+                        base_action_log_probs,
+                        kl_estimator=self.args.kl_estimator,
+                    )
+                else:
+                    kl = torch.zeros_like(action_log_probs, dtype=action_log_probs.dtype, device=action_log_probs.device)
+                kl_loss = masked_mean(kl, experience.action_mask)
+                experience.info["kl"] = kl_loss.detach()
             else:
-                kl = torch.zeros_like(action_log_probs, dtype=action_log_probs.dtype, device=action_log_probs.device)
-            kl_loss = masked_mean(kl, experience.action_mask)
-            experience.info["kl"] = kl_loss.detach()
-        else:
-            kl_loss = 0
+                kl_loss = 0
 
-        loss = actor_loss * rl_ctl + ce_loss * ce_ctl + kl_loss * kl_ctl
-        
+            loss = actor_loss * rl_ctl + ce_loss * ce_ctl + kl_loss * kl_ctl
+            
 
-        # mixtral
-        if self.aux_loss:
-            loss += output.aux_loss * self.args.aux_loss_coef
-        
-        # entropy loss
-        if self.args.entropy_loss_coef is not None:
-            entropy_loss = masked_mean(output.entropy[:, -experience.action_mask.shape[1] :], experience.action_mask)
-            if self.args.entropy_loss_coef != 0:
-                loss -= entropy_loss * self.args.entropy_loss_coef
- 
- 
-        if self.args.use_dynamic_batch:
-            loss = loss * self.replay_buffer.dynamic_loss_scale[step]
-           
+            # mixtral
+            if self.aux_loss:
+                loss += output.aux_loss * self.args.aux_loss_coef
+            
+            # entropy loss
+            if self.args.entropy_loss_coef is not None:
+                entropy_loss = masked_mean(output.entropy[:, -experience.action_mask.shape[1] :], experience.action_mask)
+                if self.args.entropy_loss_coef != 0:
+                    loss -= entropy_loss * self.args.entropy_loss_coef
+    
+    
+            if self.args.use_dynamic_batch:
+                loss = loss * self.replay_buffer.dynamic_loss_scale[step]
+               
 
-        self.strategy.backward(loss, self.actor, self.actor_optim)
+            self.strategy.backward(loss, self.actor, self.actor_optim)
+        finally:
+            if restore_attention_impl is not None:
+                self.actor.set_attention_implementation(restore_attention_impl)
 
         grad_norm_value: Optional[float] = None
         if getattr(self.args, "log_gradients", False):
@@ -266,8 +290,10 @@ class ActorEBFTTrainer(ABC):
         status['actor_loss'] = loss.detach().item()
         if self.args.use_kl_loss:
             status['kl_ctl_loss'] = kl_loss.detach().item()  * kl_ctl
+            status["kl"] = kl_loss.detach().item()
         else:
             status['kl_ctl_loss'] = kl_loss  * kl_ctl
+            status["kl"] = 0.0
         if self.args.entropy_loss_coef is not None:
             status["entropy_loss"] = entropy_loss.detach().item()
         # merge logs from info field
@@ -856,4 +882,3 @@ class EBFTPolicyModelActor(BaseModelActor):
                 write_run_config(save_path, args, tag=tag, client_states=client_states)
         # wait
         torch_dist_barrier_and_cuda_sync()
-

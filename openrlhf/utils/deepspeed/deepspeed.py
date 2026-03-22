@@ -136,55 +136,43 @@ class DeepspeedStrategy(ABC):
     def create_optimizer(self, model, **kwargs) -> Optimizer:
         if isinstance(model, (Actor, OriginalActor)):
             model = model.model
-        # Optimizer with fallback mechanism
-        if self.adam_offload:
-            AdamOptimizer = DeepSpeedCPUAdam
-        else:
-            try:
-                # Try to import and use FusedAdam
-                from deepspeed.ops.adam import FusedAdam
-                AdamOptimizer = FusedAdam
-                
-                # Test if FusedAdam can be instantiated (compilation happens here)
-                optim_params = get_optimizer_grouped_parameters(model, kwargs["weight_decay"])
-                optim = AdamOptimizer(optim_params, **kwargs)
-                
-                return optim
-            except Exception as e:
-                # If FusedAdam fails (compilation issues, etc.), fallback to CPU Adam
-                print(f"Warning: FusedAdam failed ({e}), falling back to DeepSpeedCPUAdam")
-                AdamOptimizer = DeepSpeedCPUAdam
-        
         optim_params = get_optimizer_grouped_parameters(model, kwargs["weight_decay"])
-        optim = AdamOptimizer(optim_params, **kwargs)
-        return optim
+        if self.adam_offload:
+            try:
+                return DeepSpeedCPUAdam(optim_params, **kwargs)
+            except Exception as e:
+                print(f"Warning: DeepSpeedCPUAdam failed ({e}), falling back to torch.optim.AdamW")
+                return torch.optim.AdamW(optim_params, **kwargs)
+
+        try:
+            return FusedAdam(optim_params, **kwargs)
+        except Exception as e:
+            print(f"Warning: FusedAdam failed ({e}), falling back to torch.optim.AdamW")
+            return torch.optim.AdamW(optim_params, **kwargs)
     
     
     def create_optimizer_critic(self, model, lr_backbone, lr_head, **kwargs) -> Optimizer:
         if isinstance(model, (Actor, OriginalActor)):
             model = model.model
-        # Optimizer with fallback mechanism
-        if self.adam_offload:
-            AdamOptimizer = DeepSpeedCPUAdam
-        else:
-            try:
-                # Try to import and use FusedAdam
-                from deepspeed.ops.adam import FusedAdam
-                AdamOptimizer = FusedAdam
-                
-                # Test if FusedAdam can be instantiated (compilation happens here)
-                optim_params = get_optimizer_grouped_parameters_head(model, lr_backbone, lr_head)
-                optim = AdamOptimizer(optim_params, **kwargs)
-                
-                return optim
-            except Exception as e:
-                # If FusedAdam fails (compilation issues, etc.), fallback to CPU Adam
-                print(f"Warning: FusedAdam failed ({e}), falling back to DeepSpeedCPUAdam")
-                AdamOptimizer = DeepSpeedCPUAdam
-        
         optim_params = get_optimizer_grouped_parameters_head(model, lr_backbone, lr_head)
-        optim = AdamOptimizer(optim_params, **kwargs)
-        return optim
+
+        # A frozen critic does not benefit from CPU optimizer offload, but the offloaded
+        # optimizer can dramatically increase host RAM during actor+critic co-initialization.
+        if float(lr_backbone) == 0.0 and float(lr_head) == 0.0:
+            return torch.optim.AdamW(optim_params, **kwargs)
+
+        if self.adam_offload:
+            try:
+                return DeepSpeedCPUAdam(optim_params, **kwargs)
+            except Exception as e:
+                print(f"Warning: DeepSpeedCPUAdam failed ({e}), falling back to torch.optim.AdamW")
+                return torch.optim.AdamW(optim_params, **kwargs)
+
+        try:
+            return FusedAdam(optim_params, **kwargs)
+        except Exception as e:
+            print(f"Warning: FusedAdam failed ({e}), falling back to torch.optim.AdamW")
+            return torch.optim.AdamW(optim_params, **kwargs)
 
 
 

@@ -42,6 +42,7 @@ def get_train_ds_config(
     return {
         "steps_per_print": 100,
         "zero_optimization": zero_opt_dict,
+        "zero_force_ds_cpu_optimizer": False,
         "bf16": {
             "enabled": bf16,
         },
@@ -132,27 +133,35 @@ def get_optimizer_grouped_parameters_head(
     model,
     lr_backbone,
     lr_head,
-    head_name_list=["classifier_head"],
+    head_name_list=["classifier_head", "feature_adapter"],
 ):
-    optimizer_grouped_parameters = [
-        {
-            "params": [
-                p
-                for n, p in model.named_parameters()
-                if (not any(nd in n for nd in head_name_list) and p.requires_grad)
-            ],
-            "lr": lr_backbone,
-        },
-        {
-            "params": [
-                p
-                for n, p in model.named_parameters()
-                if (any(nd in n for nd in head_name_list) and p.requires_grad)
-            ],
-            "lr": lr_head,
-        },
+    backbone_params = [
+        p
+        for n, p in model.named_parameters()
+        if (not any(nd in n for nd in head_name_list) and p.requires_grad)
     ]
-    # print(f"OPT STATE: {optimizer_grouped_parameters}")
+    head_params = [
+        p
+        for n, p in model.named_parameters()
+        if (any(nd in n for nd in head_name_list) and p.requires_grad)
+    ]
+
+    optimizer_grouped_parameters = []
+    if backbone_params:
+        optimizer_grouped_parameters.append(
+            {
+                "params": backbone_params,
+                "lr": lr_backbone,
+            }
+        )
+    if head_params:
+        optimizer_grouped_parameters.append(
+            {
+                "params": head_params,
+                "lr": lr_head,
+            }
+        )
+
     return optimizer_grouped_parameters
 
 

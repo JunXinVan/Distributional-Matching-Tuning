@@ -14,7 +14,10 @@ from openrlhf.utils.embedding_utils import (
     prepare_tensors_for_embedding,
     whiten_embeddings_batched,
     get_alignment_rewards,
-    get_diversity_rewards
+    get_cf_l1oo_rewards,
+    get_cf_tokencloud_l1oo_rewards,
+    get_diversity_rewards,
+    apply_feature_map,
 )
 from openrlhf.trainer.ray.launcher import RayActorGroup
 from openrlhf.utils.logging_utils import init_logger
@@ -779,24 +782,78 @@ class RemoteExperienceMaker(ABC):
             gt_embedding = gt_embedding.squeeze(-2) # (num_micro_batches, num_groups, num_seq/num_groups, num_blocks, num_features)
             gen_embedding = gen_embedding.squeeze(-2) # (num_micro_batches, num_groups, num_seq/num_groups, num_blocks, num_features)
 
+        gen_embedding = apply_feature_map(
+            gen_embedding,
+            feature_map_type=getattr(self.args, "feature_map_type", "identity"),
+            rff_num_features=getattr(self.args, "rff_num_features", 128),
+            rff_sigma=getattr(self.args, "rff_sigma", 1.0),
+            rff_seed=getattr(self.args, "rff_seed", 43),
+        )
+        gt_embedding = apply_feature_map(
+            gt_embedding,
+            feature_map_type=getattr(self.args, "feature_map_type", "identity"),
+            rff_num_features=getattr(self.args, "rff_num_features", 128),
+            rff_sigma=getattr(self.args, "rff_sigma", 1.0),
+            rff_seed=getattr(self.args, "rff_seed", 43),
+        )
+
         if self.args.embed_method == "token":
             per_token = True
         else:
             per_token = False
-        # ed or cosine
-        gt_rewards_tensor = get_alignment_rewards(gen_embedding, gt_embedding)
-        diversity_rewards_tensor = get_diversity_rewards(gen_embedding, per_token)
-        if per_token:
-            # token-level rewards
-            gt_rewards_tensor = gt_rewards_tensor.reshape(gt_rewards_tensor.shape[0], -1, gt_rewards_tensor.shape[-2], gt_rewards_tensor.shape[-1])
-            diversity_rewards_tensor = diversity_rewards_tensor.reshape(diversity_rewards_tensor.shape[0], -1, diversity_rewards_tensor.shape[-2], diversity_rewards_tensor.shape[-1])
-        else:
+
+        reward_type = getattr(self.args, "distribution_reward_type", "pointwise")
+        if reward_type == "pointwise":
+            gt_rewards_tensor = get_alignment_rewards(gen_embedding, gt_embedding)
+            diversity_rewards_tensor = get_diversity_rewards(gen_embedding, per_token)
+            if per_token:
+                # token-level rewards
+                gt_rewards_tensor = gt_rewards_tensor.reshape(gt_rewards_tensor.shape[0], -1, gt_rewards_tensor.shape[-2], gt_rewards_tensor.shape[-1])
+                diversity_rewards_tensor = diversity_rewards_tensor.reshape(diversity_rewards_tensor.shape[0], -1, diversity_rewards_tensor.shape[-2], diversity_rewards_tensor.shape[-1])
+            else:
+                gt_rewards_tensor = gt_rewards_tensor.reshape(gt_rewards_tensor.shape[0], -1, gt_rewards_tensor.shape[-1])
+                diversity_rewards_tensor = diversity_rewards_tensor.reshape(diversity_rewards_tensor.shape[0], -1, diversity_rewards_tensor.shape[-1])
+
+            # NOTE: We keep the *raw* component tensors (gt/diversity/critic) for logging,
+            # and apply scalar coefficients only when forming the final reward used for advantages.
+            gt_rewards_tensor *= 2
+            diversity_rewards_tensor *= 2
+        elif reward_type == "cf_l1oo":
+            if per_token:
+                raise NotImplementedError("cf_l1oo currently supports non-token embeddings only")
+            gt_rewards_tensor = get_cf_l1oo_rewards(
+                gen_embedding,
+                gt_embedding,
+                cf_num_freqs=getattr(self.args, "cf_num_freqs", 128),
+                cf_sigma=getattr(self.args, "cf_sigma", 1.0),
+                cf_seed=getattr(self.args, "cf_seed", 43),
+                cf_alpha=getattr(self.args, "cf_alpha", 0.5),
+                cf_beta=getattr(self.args, "cf_beta", 0.5),
+                cf_reward_scale=getattr(self.args, "cf_reward_scale", 1.0),
+                cf_target_mode=getattr(self.args, "cf_target_mode", "single"),
+                cf_target_num_refs=getattr(self.args, "cf_target_num_refs", 1),
+                cf_target_std=getattr(self.args, "cf_target_std", 0.05),
+                cf_target_seed=getattr(self.args, "cf_target_seed", 43),
+            )
             gt_rewards_tensor = gt_rewards_tensor.reshape(gt_rewards_tensor.shape[0], -1, gt_rewards_tensor.shape[-1])
-            diversity_rewards_tensor = diversity_rewards_tensor.reshape(diversity_rewards_tensor.shape[0], -1, diversity_rewards_tensor.shape[-1])
-        # NOTE: We keep the *raw* component tensors (gt/diversity/critic) for logging,
-        # and apply scalar coefficients only when forming the final reward used for advantages.
-        gt_rewards_tensor *= 2
-        diversity_rewards_tensor *= 2
+            diversity_rewards_tensor = torch.zeros_like(gt_rewards_tensor)
+        elif reward_type == "cf_tokencloud_l1oo":
+            if not per_token:
+                raise NotImplementedError("cf_tokencloud_l1oo expects embed_method=token")
+            gt_rewards_tensor = get_cf_tokencloud_l1oo_rewards(
+                gen_embedding,
+                gt_embedding,
+                cf_num_freqs=getattr(self.args, "cf_num_freqs", 128),
+                cf_sigma=getattr(self.args, "cf_sigma", 1.0),
+                cf_seed=getattr(self.args, "cf_seed", 43),
+                cf_alpha=getattr(self.args, "cf_alpha", 0.5),
+                cf_beta=getattr(self.args, "cf_beta", 0.5),
+                cf_reward_scale=getattr(self.args, "cf_reward_scale", 1.0),
+            )
+            gt_rewards_tensor = gt_rewards_tensor.reshape(gt_rewards_tensor.shape[0], -1, gt_rewards_tensor.shape[-1])
+            diversity_rewards_tensor = torch.zeros_like(gt_rewards_tensor)
+        else:
+            raise ValueError(f"Unknown distribution_reward_type: {reward_type}")
 
         if getattr(self.args, "debug", False):
             logger.info(
@@ -854,6 +911,7 @@ class RemoteExperienceMaker(ABC):
             samples.info["diversity_reward"] = samples.diversity_rewards.mean().detach().cpu().item()
             samples.info["gt_reward"] = samples.gt_rewards.mean().detach().cpu().item()
             samples.info["feature_map_reward"] = feature_map_reward.mean().detach().cpu().item()
+            samples.info["distribution_reward"] = feature_map_reward.mean().detach().cpu().item()
             if tokmatch_i is not None:
                 samples.info["tokmatch"] = tokmatch_i.mean().detach().cpu().item()
 
@@ -990,6 +1048,21 @@ class RemoteExperienceMaker(ABC):
             # (num_batches, batch_size, num_blocks)
             baseline = self.compute_baseline(raw_diversity_rewards, raw_gt_rewards, args.n_samples_per_prompt)
             shaped_rewards = raw_rewards - baseline #(num_batches, batch_size/nsamp, nsamp, num_blocks)
+            
+            # Diagnostic logging for G2
+            logger.info(
+                f"[RLOO Diagnostic] raw_rewards: mean={raw_rewards.mean().item():.6f}, "
+                f"std={raw_rewards.std().item():.6f}, min={raw_rewards.min().item():.6f}, max={raw_rewards.max().item():.6f}, "
+                f"shape={raw_rewards.shape}"
+            )
+            logger.info(
+                f"[RLOO Diagnostic] baseline: mean={baseline.mean().item():.6f}, "
+                f"std={baseline.std().item():.6f}, shape={baseline.shape}"
+            )
+            logger.info(
+                f"[RLOO Diagnostic] shaped_rewards (after baseline): mean={shaped_rewards.mean().item():.6f}, "
+                f"std={shaped_rewards.std().item():.6f}, min={shaped_rewards.min().item():.6f}, max={shaped_rewards.max().item():.6f}"
+            )
 
         elif args.advantage_estimator in ["reinforce"]:
             shaped_rewards = raw_rewards
@@ -998,6 +1071,20 @@ class RemoteExperienceMaker(ABC):
             # Group normalization: subtract baseline and normalize by standard deviation
             baseline = self.compute_baseline(raw_diversity_rewards, raw_gt_rewards, args.n_samples_per_prompt)
             shaped_rewards = (raw_rewards - baseline) / (raw_rewards.std(-1, keepdim=True) + 1e-9)
+        
+        elif args.advantage_estimator in ["reinforce_baseline", "dr_grpo"]:
+            # Similar to rloo but with different baseline computation
+            baseline = self.compute_baseline(raw_diversity_rewards, raw_gt_rewards, args.n_samples_per_prompt)
+            shaped_rewards = raw_rewards - baseline
+        
+        elif args.advantage_estimator == "gae":
+            # For GAE, use raw rewards directly (GAE handles advantage computation separately)
+            shaped_rewards = raw_rewards
+        
+        else:
+            # Fallback for any other advantage estimators
+            logger.warning(f"Unknown advantage_estimator '{args.advantage_estimator}', using raw rewards")
+            shaped_rewards = raw_rewards
 
         reward_list = list(shaped_rewards)
 
@@ -1025,7 +1112,7 @@ class RemoteExperienceMaker(ABC):
             full_sequence_rewards[:, -expanded_rewards.shape[-1]:] = expanded_rewards
 
             # Compute advantages and returns based on the estimator type
-            if self.advantage_estimator in ["reinforce", "rloo", "reinforce_baseline", "group_norm", "dr_grpo"]:
+            if self.advantage_estimator in ["reinforce", "rloo", "reinforce_baseline", "group_norm", "dr_grpo", "gae"]:
                 # REINFORCE variants: use rewards directly as returns
                 if args.gamma != 1.0 and self.advantage_estimator in ["rloo", "reinforce_baseline", "group_norm", "dr_grpo"]:
                     logger.warning("gamma is set to 1.0 for rloo, reinforce_baseline, and group_norm")
@@ -1033,6 +1120,13 @@ class RemoteExperienceMaker(ABC):
 
                 experience.returns = full_sequence_rewards
                 experience.advantages = deepcopy(experience.returns)
+                
+                # Diagnostic logging for advantages
+                logger.info(
+                    f"[Advantage Diagnostic] advantages: mean={experience.advantages.mean().item():.6f}, "
+                    f"std={experience.advantages.std().item():.6f}, min={experience.advantages.min().item():.6f}, "
+                    f"max={experience.advantages.max().item():.6f}, shape={experience.advantages.shape}"
+                )
             else:
                 raise Exception(f"Unknown advantage_estimator: {self.advantage_estimator}")
 
@@ -1268,4 +1362,3 @@ class RemoteExperienceMaker(ABC):
             "eval_loss_masks":       eval_loss_masks_list,
             "prompt_len": prompt_len_list,
         }
-
