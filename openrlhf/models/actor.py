@@ -138,6 +138,15 @@ class Actor(nn.Module):
         """Return the config of the model for compatibility with save_model."""
         return self.model.config
 
+    def get_attention_implementation(self):
+        """Return the current HF attention implementation, if exposed by the config."""
+        return getattr(self.model.config, "_attn_implementation", None)
+
+    def set_attention_implementation(self, impl: str):
+        """Update the HF attention implementation on the wrapped model config."""
+        if hasattr(self.model, "config"):
+            self.model.config._attn_implementation = impl
+
     def prepare_logprobs(self, logits, prompt_len, context_len, num_blocks, stride):
         """Prepare logits for log-probability computation.
 

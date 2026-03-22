@@ -163,7 +163,8 @@ def build_strided_attention_mask_and_positions(
             context_window_end = min(block_idx * stride + context_length, prompt_length - max_generation_length)
 
             # Get the document that the first ground truth token belongs to. This is the document associated with the generation at this given anchor
-            cur_doc_ids = doc_ids[:,context_window_end+gen_step].unsqueeze(-1) # shape(B,1)
+            anchor_idx = min(context_window_end + gen_step, doc_ids.shape[1] - 1)
+            cur_doc_ids = doc_ids[:, anchor_idx].unsqueeze(-1) # shape(B,1)
 
             # So far we have been taking all preceding tokens as context. we want to mask out those that are not from the same doc as cur_doc_ids
             # Get the document ids for all tokens preceding. (B, context_window_end)
@@ -182,12 +183,12 @@ def build_strided_attention_mask_and_positions(
 
             if gen_step > 0:
                 # Prompt index that this generated token is anchored to
-                cur_anchor_idx = context_window_end + gen_step               # scalar
+                cur_anchor_idx = min(context_window_end + gen_step, doc_ids.shape[1] - 1)
                 cur_doc = doc_ids[:, cur_anchor_idx]                         # (B,)
 
                 for prev_s in range(gen_step):
                     # Prompt index for the previous generation step in the same block
-                    prev_anchor_idx = context_window_end + prev_s            # scalar
+                    prev_anchor_idx = min(context_window_end + prev_s, doc_ids.shape[1] - 1)
 
                     # Full-sequence index for that previous generated token
                     prev_pos = (
