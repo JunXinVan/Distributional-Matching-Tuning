@@ -144,7 +144,9 @@ class Actor(nn.Module):
 
     def set_attention_implementation(self, impl: str):
         """Update the HF attention implementation on the wrapped model config."""
-        if hasattr(self.model, "config"):
+        if hasattr(self.model, "set_attn_implementation"):
+            self.model.set_attn_implementation(impl)
+        elif hasattr(self.model, "config"):
             self.model.config._attn_implementation = impl
 
     def prepare_logprobs(self, logits, prompt_len, context_len, num_blocks, stride):
