@@ -334,30 +334,6 @@ class SamplesGenerator:
             qa_masks = torch.stack(all_qa_masks[s : s + batch_size])
             batches.append((s // batch_size, chunk, doc_ids, qa_masks))
 
-        if batches and not getattr(self, "_ran_standard_ar_precheck", False):
-            smoke_actor = actors[0]
-            smoke_prompts = batches[0][1][:1].clone()
-            logger.warning(
-                "Running one-shot standard AR precheck before strided generation | prompts_shape=%s",
-                tuple(smoke_prompts.shape),
-            )
-            try:
-                smoke_ref = smoke_actor.generate_standard_ar.remote(
-                    prompts=smoke_prompts,
-                    generate_length=1,
-                    temperature=temperature,
-                    top_p=top_p,
-                )
-                smoke_out = ray.get(smoke_ref)
-                logger.warning(
-                    "Standard AR precheck succeeded before strided generation | output_shape=%s",
-                    tuple(smoke_out.shape) if isinstance(smoke_out, torch.Tensor) else type(smoke_out).__name__,
-                )
-                self._ran_standard_ar_precheck = True
-            except Exception:
-                logger.exception("Standard AR precheck failed before strided generation.")
-                raise
-
         # ---------- 3) Submit one RPC per batch (true async), round-robin across actors ----------
         inflight_refs = []
         for k, (bid, batch_2d, doc_ids, qa_masks) in enumerate(batches):
