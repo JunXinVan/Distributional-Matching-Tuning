@@ -642,6 +642,46 @@ class EBFTPolicyModelActor(BaseModelActor):
         """
         device = torch.cuda.current_device()
         self.actor.eval()
+        vocab_size = None
+        try:
+            vocab_size = int(self.actor.model.config.vocab_size)
+        except Exception:
+            pass
+
+        if not getattr(self, "_logged_standard_ar_input_debug", False):
+            prompts_cpu = prompts.detach().cpu() if isinstance(prompts, torch.Tensor) else torch.as_tensor(prompts, dtype=torch.long)
+            logger.warning(
+                "generate_standard_ar input summary | vocab_size=%s | generate_length=%s | "
+                "prompts: shape=%s, dtype=%s, min=%s, max=%s",
+                vocab_size,
+                generate_length,
+                tuple(prompts_cpu.shape),
+                prompts_cpu.dtype,
+                prompts_cpu.min().item() if prompts_cpu.numel() else None,
+                prompts_cpu.max().item() if prompts_cpu.numel() else None,
+            )
+            self._logged_standard_ar_input_debug = True
+
+        if vocab_size is not None:
+            prompts_cpu = prompts.detach().cpu() if isinstance(prompts, torch.Tensor) else torch.as_tensor(prompts, dtype=torch.long)
+            invalid_mask = (prompts_cpu < 0) | (prompts_cpu >= vocab_size)
+            if invalid_mask.any():
+                invalid_positions = invalid_mask.nonzero(as_tuple=False)[:8].tolist()
+                invalid_values = prompts_cpu[invalid_mask][:8].tolist()
+                raise ValueError(
+                    f"generate_standard_ar prompts contain out-of-range token ids for vocab_size={vocab_size}. "
+                    f"sample_positions={invalid_positions}, sample_values={invalid_values}"
+                )
+
+        try:
+            torch.cuda.synchronize(device)
+        except RuntimeError:
+            logger.error(
+                "CUDA failure surfaced before prompt transfer in generate_standard_ar. "
+                "This suggests an earlier kernel already poisoned the CUDA stream.",
+                exc_info=True,
+            )
+            raise
 
         with torch.inference_mode():
             # Generate tokens one at a time (standard autoregressive)
@@ -654,6 +694,7 @@ class EBFTPolicyModelActor(BaseModelActor):
                 eos_token_id=self.tokenizer.eos_token_id,
                 pad_token_id=self.tokenizer.pad_token_id,
             )
+            torch.cuda.synchronize(device)
 
         # Return as CPU tensor
         self.actor.train()
