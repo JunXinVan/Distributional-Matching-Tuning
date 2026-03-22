@@ -913,13 +913,29 @@ class EBFTPolicyModelActor(BaseModelActor):
                 else:
                     raise ValueError(f"Unexpected attention_mask dim: {attention_mask.dim()}")
 
+                restore_attention_impl = None
+                if attention_mask.dim() == 4:
+                    current_impl = self.actor.get_attention_implementation()
+                    if current_impl == "flash_attention_2":
+                        # Dense 4D additive masks are not reliably supported by the
+                        # FA2 path in this strided generation loop. Keep flash as the
+                        # default model setting, but temporarily fall back to eager
+                        # just for this masked forward pass.
+                        restore_attention_impl = current_impl
+                        self.actor.set_attention_implementation("eager")
+
                 # Forward pass through the model to get logits for all positions
-                output = self.actor(
-                    full_sequence,
-                    attention_mask=attention_mask,
-                    pos_ids=position_ids,
-                    return_output=True,
-                )
+                try:
+                    output = self.actor(
+                        full_sequence,
+                        attention_mask=attention_mask,
+                        pos_ids=position_ids,
+                        return_output=True,
+                    )
+                finally:
+                    if restore_attention_impl is not None:
+                        self.actor.set_attention_implementation(restore_attention_impl)
+
                 all_logits = output.logits  # Shape: [batch_size, sequence_length, vocab_size]
                 del output
 
