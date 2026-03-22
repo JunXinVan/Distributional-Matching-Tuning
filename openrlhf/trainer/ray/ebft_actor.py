@@ -648,8 +648,17 @@ class EBFTPolicyModelActor(BaseModelActor):
         except Exception:
             pass
 
+        if isinstance(prompts, dict):
+            prompt_ids = prompts["input_ids"]
+        else:
+            prompt_ids = prompts
+
         if not getattr(self, "_logged_standard_ar_input_debug", False):
-            prompts_cpu = prompts.detach().cpu() if isinstance(prompts, torch.Tensor) else torch.as_tensor(prompts, dtype=torch.long)
+            prompts_cpu = (
+                prompt_ids.detach().cpu()
+                if isinstance(prompt_ids, torch.Tensor)
+                else torch.as_tensor(prompt_ids, dtype=torch.long)
+            )
             logger.warning(
                 "generate_standard_ar input summary | vocab_size=%s | generate_length=%s | "
                 "prompts: shape=%s, dtype=%s, min=%s, max=%s",
@@ -663,7 +672,11 @@ class EBFTPolicyModelActor(BaseModelActor):
             self._logged_standard_ar_input_debug = True
 
         if vocab_size is not None:
-            prompts_cpu = prompts.detach().cpu() if isinstance(prompts, torch.Tensor) else torch.as_tensor(prompts, dtype=torch.long)
+            prompts_cpu = (
+                prompt_ids.detach().cpu()
+                if isinstance(prompt_ids, torch.Tensor)
+                else torch.as_tensor(prompt_ids, dtype=torch.long)
+            )
             invalid_mask = (prompts_cpu < 0) | (prompts_cpu >= vocab_size)
             if invalid_mask.any():
                 invalid_positions = invalid_mask.nonzero(as_tuple=False)[:8].tolist()
@@ -685,9 +698,16 @@ class EBFTPolicyModelActor(BaseModelActor):
 
         with torch.inference_mode():
             # Generate tokens one at a time (standard autoregressive)
+            if isinstance(prompts, dict):
+                model_inputs = {
+                    k: v.to(device) if isinstance(v, torch.Tensor) else v
+                    for k, v in prompts.items()
+                }
+            else:
+                model_inputs = prompts.to(device)
+
             out = self.actor.generate_for_downstream(
-                # sequences=sequence,
-                sequences=prompts.to(device),
+                sequences=model_inputs,
                 temperature=temperature,
                 top_p=top_p,
                 max_new_tokens=generate_length,

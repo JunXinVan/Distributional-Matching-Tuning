@@ -1,3 +1,4 @@
+from collections.abc import Mapping
 from typing import Optional
 
 import torch
@@ -189,8 +190,13 @@ class Actor(nn.Module):
             pad_token_id: int,
 
     ) -> torch.Tensor:
+        if isinstance(sequences, Mapping):
+            model_inputs = dict(sequences)
+        else:
+            model_inputs = {"input_ids": sequences}
+
         output = self.model.generate(
-                **sequences,
+                **model_inputs,
                 max_new_tokens=max_new_tokens,
                 do_sample=True if temperature > 0.0 else False,
                 temperature=temperature,
