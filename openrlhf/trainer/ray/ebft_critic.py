@@ -802,24 +802,38 @@ class EBFTCriticModelActor(BaseModelActor):
                 stride=stride,
                 num_blocks=num_blocks,
                 device=device,
-                doc_ids=doc_ids[:prompt_length],
+                doc_ids=doc_ids[:, :prompt_length] if doc_ids is not None else None,
                 document_masking=document_masking,
             )
             _model = self.ema_model if self.ema_model else self.critic
-            hidden_states, reward = _model(
-                sequences.to(device),
-                attention_mask=attention_mask.to(device),
-                pos_ids=pos_ids.to(device),
-                return_classifier_logits=False,
-                context_length=context_length,
-                prompt_length=prompt_length,
-                generate_max_len=generate_max_len,
-                stride=stride,
-                num_blocks=num_blocks,
-                hidden_state_method=hidden_state_method,
-                qa_masks=qa_masks.to(device),
-                qa_masking=qa_masking,
-            )
+            restore_attention_impl = None
+            if (
+                attention_mask is not None
+                and attention_mask.dim() == 4
+                and getattr(self.strategy.args, "gradient_checkpointing", False)
+            ):
+                current_impl = _model.get_attention_implementation()
+                if current_impl == "flash_attention_2":
+                    restore_attention_impl = current_impl
+                    _model.set_attention_implementation("eager")
+            try:
+                hidden_states, reward = _model(
+                    sequences.to(device),
+                    attention_mask=attention_mask.to(device),
+                    pos_ids=pos_ids.to(device),
+                    return_classifier_logits=False,
+                    context_length=context_length,
+                    prompt_length=prompt_length,
+                    generate_max_len=generate_max_len,
+                    stride=stride,
+                    num_blocks=num_blocks,
+                    hidden_state_method=hidden_state_method,
+                    qa_masks=qa_masks.to(device),
+                    qa_masking=qa_masking,
+                )
+            finally:
+                if restore_attention_impl is not None:
+                    _model.set_attention_implementation(restore_attention_impl)
         self.critic.train()  # reset model state
         return hidden_states.to("cpu"), reward.to("cpu")
 
