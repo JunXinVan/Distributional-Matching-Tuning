@@ -144,8 +144,8 @@ def main():
     model = AutoModelForCausalLM.from_pretrained(
         args.model_checkpoint,
         torch_dtype=torch_dtype,
-        device_map=args.device,
     )
+    model = model.to(args.device)
     tokenizer = AutoTokenizer.from_pretrained(args.model_checkpoint)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
