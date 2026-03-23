@@ -226,11 +226,16 @@ def get_llm_answer(text):
     return parse(text), response_type
 
 
-def verify_llm_answer(llm_text, answer_text):
+def verify_llm_answer(llm_text, answer_text, *, raise_on_error: bool = False, timeout_seconds: int = 5):
     llm_answer, _ = get_llm_answer(llm_text)
     # Wrap answer in \boxed{} for proper parsing (math_verify requires this)
-    correct_answer = parse(f"\\boxed{{{answer_text}}}")
-    return verify(llm_answer, correct_answer)
+    correct_answer = parse(f"\\boxed{{{answer_text}}}", raise_on_error=raise_on_error)
+    return verify(
+        llm_answer,
+        correct_answer,
+        timeout_seconds=timeout_seconds,
+        raise_on_error=raise_on_error,
+    )
 
 
 if __name__ == "__main__":
