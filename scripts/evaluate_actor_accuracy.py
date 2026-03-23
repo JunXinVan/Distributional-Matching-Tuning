@@ -65,11 +65,42 @@ def parse_args():
     )
     parser.add_argument("--device", type=str, default="cuda", help="Device to use")
     parser.add_argument(
+        "--backend",
+        type=str,
+        default="transformers",
+        choices=["transformers", "vllm"],
+        help="Inference backend. Use vllm for high-throughput multi-GPU evaluation.",
+    )
+    parser.add_argument(
         "--dtype",
         type=str,
         default="bfloat16",
         choices=["float32", "float16", "bfloat16"],
         help="Model dtype",
+    )
+    parser.add_argument(
+        "--tensor_parallel_size",
+        type=int,
+        default=1,
+        help="Tensor parallel size for vLLM backend.",
+    )
+    parser.add_argument(
+        "--gpu_memory_utilization",
+        type=float,
+        default=0.85,
+        help="vLLM gpu_memory_utilization.",
+    )
+    parser.add_argument(
+        "--max_num_seqs",
+        type=int,
+        default=256,
+        help="vLLM max_num_seqs.",
+    )
+    parser.add_argument(
+        "--enable_prefix_caching",
+        action="store_true",
+        default=False,
+        help="Enable prefix caching for vLLM backend.",
     )
     parser.add_argument("--seed", type=int, default=43, help="Random seed")
     parser.add_argument("--num_shards", type=int, default=1, help="Total number of dataset shards")
@@ -136,58 +167,28 @@ def build_prompts_and_answers(dataset, input_key: str, answer_key: str, prompt_s
     return prompts, answers
 
 
-def main():
-    args = parse_args()
-    set_seed(args.seed)
-
+def generate_with_transformers(args, prompts: List[str]):
     torch_dtype = get_torch_dtype(args.dtype)
 
-    logger.info("Loading actor-only evaluation model...")
+    logger.info("Loading actor-only evaluation model with transformers backend...")
     model = AutoModelForCausalLM.from_pretrained(
         args.model_checkpoint,
         torch_dtype=torch_dtype,
+        trust_remote_code=True,
     )
     model = model.to(args.device)
-    tokenizer = AutoTokenizer.from_pretrained(args.model_checkpoint)
+    tokenizer = AutoTokenizer.from_pretrained(args.model_checkpoint, trust_remote_code=True)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
         model.config.pad_token_id = tokenizer.eos_token_id
     tokenizer.padding_side = "left"
     model.eval()
 
-    dataset = load_eval_dataset(args.eval_dataset, args.eval_split)
-    if args.eval_max_samples is not None and args.eval_max_samples > 0:
-        dataset = dataset.select(range(min(args.eval_max_samples, len(dataset))))
-
-    if args.num_shards < 1:
-        raise ValueError(f"--num_shards must be >= 1, got {args.num_shards}")
-    if not 0 <= args.shard_idx < args.num_shards:
-        raise ValueError(
-            f"--shard_idx must be in [0, {args.num_shards}), got {args.shard_idx}"
-        )
-    if args.num_shards > 1:
-        shard_indices = list(range(args.shard_idx, len(dataset), args.num_shards))
-        dataset = dataset.select(shard_indices)
-        logger.info(
-            f"Using dataset shard {args.shard_idx}/{args.num_shards} with {len(dataset)} samples"
-        )
-
-    prompts, answers = build_prompts_and_answers(dataset, args.input_key, args.answer_key, args.prompt_suffix)
-
-    logger.info(f"Evaluating {len(prompts)} samples")
-    logger.info(f"answer_key={args.answer_key}, temperature={args.temperature}, batch_size={args.batch_size}")
-
-    predictions = []
-    mismatches = []
-    correct = 0
-    total = 0
-
     do_sample = args.temperature > 0
 
     for start in tqdm(range(0, len(prompts), args.batch_size), desc="Evaluating"):
         end = min(start + args.batch_size, len(prompts))
         batch_prompts = prompts[start:end]
-        batch_answers = answers[start:end]
 
         inputs = tokenizer(
             batch_prompts,
@@ -217,11 +218,105 @@ def main():
             outputs = model.generate(**generate_kwargs)
 
         outputs = outputs.detach().cpu()
-
-        for local_idx, (gold_answer, prompt, prompt_len) in enumerate(zip(batch_answers, batch_prompts, prompt_lengths)):
+        responses = []
+        for local_idx, prompt_len in enumerate(prompt_lengths):
             seq = outputs[local_idx]
             generated_ids = seq[prompt_len:]
-            response = tokenizer.decode(generated_ids, skip_special_tokens=True).strip()
+            responses.append(tokenizer.decode(generated_ids, skip_special_tokens=True).strip())
+        yield start, batch_prompts, responses
+
+
+def generate_with_vllm(args, prompts: List[str]):
+    try:
+        from vllm import LLM, SamplingParams
+    except ImportError as e:
+        raise ImportError(
+            "vLLM backend requested but vllm is not installed in the current environment."
+        ) from e
+
+    logger.info("Loading actor-only evaluation model with vLLM backend...")
+    logger.info(
+        "vLLM config: tp=%s, gpu_memory_utilization=%.2f, max_num_seqs=%s, prefix_caching=%s",
+        args.tensor_parallel_size,
+        args.gpu_memory_utilization,
+        args.max_num_seqs,
+        args.enable_prefix_caching,
+    )
+
+    llm = LLM(
+        model=args.model_checkpoint,
+        tensor_parallel_size=args.tensor_parallel_size,
+        dtype=args.dtype,
+        trust_remote_code=True,
+        seed=args.seed,
+        gpu_memory_utilization=args.gpu_memory_utilization,
+        max_num_seqs=args.max_num_seqs,
+        enable_prefix_caching=args.enable_prefix_caching,
+    )
+    sampling_params = SamplingParams(
+        temperature=args.temperature,
+        top_p=args.top_p,
+        repetition_penalty=args.repetition_penalty,
+        max_tokens=args.max_new_tokens,
+        skip_special_tokens=True,
+        truncate_prompt_tokens=args.prompt_max_len,
+    )
+
+    for start in tqdm(range(0, len(prompts), args.batch_size), desc="Evaluating"):
+        end = min(start + args.batch_size, len(prompts))
+        batch_prompts = prompts[start:end]
+        outputs = llm.generate(batch_prompts, sampling_params)
+        responses = [output.outputs[0].text.strip() for output in outputs]
+        yield start, batch_prompts, responses
+
+
+def main():
+    args = parse_args()
+    set_seed(args.seed)
+
+    dataset = load_eval_dataset(args.eval_dataset, args.eval_split)
+    if args.eval_max_samples is not None and args.eval_max_samples > 0:
+        dataset = dataset.select(range(min(args.eval_max_samples, len(dataset))))
+
+    if args.num_shards < 1:
+        raise ValueError(f"--num_shards must be >= 1, got {args.num_shards}")
+    if not 0 <= args.shard_idx < args.num_shards:
+        raise ValueError(
+            f"--shard_idx must be in [0, {args.num_shards}), got {args.shard_idx}"
+        )
+    if args.num_shards > 1:
+        shard_indices = list(range(args.shard_idx, len(dataset), args.num_shards))
+        dataset = dataset.select(shard_indices)
+        logger.info(
+            f"Using dataset shard {args.shard_idx}/{args.num_shards} with {len(dataset)} samples"
+        )
+
+    prompts, answers = build_prompts_and_answers(dataset, args.input_key, args.answer_key, args.prompt_suffix)
+
+    logger.info(f"Evaluating {len(prompts)} samples")
+    logger.info(
+        "answer_key=%s, backend=%s, temperature=%s, batch_size=%s",
+        args.answer_key,
+        args.backend,
+        args.temperature,
+        args.batch_size,
+    )
+
+    predictions = []
+    mismatches = []
+    correct = 0
+    total = 0
+
+    if args.backend == "vllm":
+        batch_iterator = generate_with_vllm(args, prompts)
+    else:
+        batch_iterator = generate_with_transformers(args, prompts)
+
+    for start, batch_prompts, responses in batch_iterator:
+        end = min(start + len(batch_prompts), len(prompts))
+        batch_answers = answers[start:end]
+
+        for local_idx, (gold_answer, prompt, response) in enumerate(zip(batch_answers, batch_prompts, responses)):
 
             try:
                 is_correct = bool(verify_llm_answer(response, gold_answer))
@@ -250,6 +345,7 @@ def main():
             "eval_split": args.eval_split,
             "input_key": args.input_key,
             "answer_key": args.answer_key,
+            "backend": args.backend,
             "eval_max_samples": args.eval_max_samples,
             "batch_size": args.batch_size,
             "prompt_max_len": args.prompt_max_len,
@@ -257,6 +353,10 @@ def main():
             "temperature": args.temperature,
             "top_p": args.top_p,
             "repetition_penalty": args.repetition_penalty,
+            "tensor_parallel_size": args.tensor_parallel_size,
+            "gpu_memory_utilization": args.gpu_memory_utilization,
+            "max_num_seqs": args.max_num_seqs,
+            "enable_prefix_caching": args.enable_prefix_caching,
             "prompt_suffix": args.prompt_suffix,
             "seed": args.seed,
             "num_shards": args.num_shards,
