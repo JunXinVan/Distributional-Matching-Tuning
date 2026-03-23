@@ -238,25 +238,54 @@ def pack_to_fixed_chunks(
 
 def load_eval_dataset(args):
     """Load evaluation dataset."""
-    # Load dataset
+    eval_dataset_path = Path(args.eval_dataset).expanduser()
+
+    # Local file input: json/jsonl
+    if eval_dataset_path.is_file():
+        if eval_dataset_path.suffix.lower() not in {".json", ".jsonl"}:
+            raise ValueError(
+                f"Unsupported local dataset file format for {eval_dataset_path}. "
+                "Only .json and .jsonl are supported."
+            )
+        logger.info(f"Loading local evaluation dataset file: {eval_dataset_path}")
+        return load_dataset("json", data_files={args.eval_split: str(eval_dataset_path)})[args.eval_split]
+
+    # Local directory input: resolve a single json/jsonl file inside it.
+    if eval_dataset_path.is_dir():
+        candidates = sorted(
+            p for p in eval_dataset_path.iterdir()
+            if p.is_file() and p.suffix.lower() in {".json", ".jsonl"}
+        )
+        if not candidates:
+            raise ValueError(
+                f"No .json/.jsonl dataset files found under local directory {eval_dataset_path}"
+            )
+        if len(candidates) > 1:
+            raise ValueError(
+                f"Multiple dataset files found under {eval_dataset_path}: "
+                f"{[p.name for p in candidates]}. Please pass the exact file path."
+            )
+        dataset_file = candidates[0]
+        logger.info(f"Loading local evaluation dataset directory via file: {dataset_file}")
+        return load_dataset("json", data_files={args.eval_split: str(dataset_file)})[args.eval_split]
+
+    # Hub dataset input
     if args.eval_dataset == "openai/gsm8k":
-        eval_data = load_dataset(args.eval_dataset, name='main')[args.eval_split]
-    else:
-        eval_data = load_dataset(args.eval_dataset)[args.eval_split]
-
-
-    return eval_data
+        return load_dataset(args.eval_dataset, name="main")[args.eval_split]
+    return load_dataset(args.eval_dataset)[args.eval_split]
 
 
 def preprocess_data(sample, input_key, label_key):
     """Simple preprocessing function."""
-    if input_key and label_key:
+    if input_key and input_key in sample:
         prompt = sample[input_key]
+    else:
+        prompt = sample.get("question", sample.get("prompt", ""))
+
+    if label_key and label_key in sample:
         label = sample[label_key]
     else:
-        # Fallback to default keys
-        prompt = sample.get("question", sample.get("prompt", ""))
-        label = sample.get("answer", sample.get("completion", ""))
+        label = sample.get("answer", sample.get("solution", sample.get("completion", "")))
 
     return prompt, label
 
@@ -345,7 +374,7 @@ def evaluate(args):
     logger.info(f"Total packed chunks before limiting: {len(packed_sequences)}")
 
     # Apply max_samples AFTER packing to limit number of packed sequences
-    if args.eval_max_samples > 0 and len(packed_sequences) > args.eval_max_samples:
+    if args.eval_max_samples is not None and args.eval_max_samples > 0 and len(packed_sequences) > args.eval_max_samples:
         logger.info(f"Limiting to first {args.eval_max_samples} packed sequences (from {len(packed_sequences)})")
         packed_sequences = packed_sequences[:args.eval_max_samples]
         packed_doc_ids = packed_doc_ids[:args.eval_max_samples]
