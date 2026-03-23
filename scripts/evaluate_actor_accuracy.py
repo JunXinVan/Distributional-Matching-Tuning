@@ -72,6 +72,8 @@ def parse_args():
         help="Model dtype",
     )
     parser.add_argument("--seed", type=int, default=43, help="Random seed")
+    parser.add_argument("--num_shards", type=int, default=1, help="Total number of dataset shards")
+    parser.add_argument("--shard_idx", type=int, default=0, help="Current shard index in [0, num_shards)")
     parser.add_argument("--output_file", type=str, required=True, help="Path to summary json output")
     parser.add_argument(
         "--predictions_file",
@@ -156,6 +158,19 @@ def main():
     dataset = load_eval_dataset(args.eval_dataset, args.eval_split)
     if args.eval_max_samples is not None and args.eval_max_samples > 0:
         dataset = dataset.select(range(min(args.eval_max_samples, len(dataset))))
+
+    if args.num_shards < 1:
+        raise ValueError(f"--num_shards must be >= 1, got {args.num_shards}")
+    if not 0 <= args.shard_idx < args.num_shards:
+        raise ValueError(
+            f"--shard_idx must be in [0, {args.num_shards}), got {args.shard_idx}"
+        )
+    if args.num_shards > 1:
+        shard_indices = list(range(args.shard_idx, len(dataset), args.num_shards))
+        dataset = dataset.select(shard_indices)
+        logger.info(
+            f"Using dataset shard {args.shard_idx}/{args.num_shards} with {len(dataset)} samples"
+        )
 
     prompts, answers = build_prompts_and_answers(dataset, args.input_key, args.answer_key, args.prompt_suffix)
 
@@ -244,6 +259,8 @@ def main():
             "repetition_penalty": args.repetition_penalty,
             "prompt_suffix": args.prompt_suffix,
             "seed": args.seed,
+            "num_shards": args.num_shards,
+            "shard_idx": args.shard_idx,
             "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
         },
         "metrics": {
